@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "iam-onboarding-agent"
+version = "0.7.0"
+description = "Provider-general IAM on-boarding agent: plan, approve, execute, audit."
+requires-python = ">=3.10"
+
+[project.scripts]
+iam-onboard = "iam_agent.cli:main"
+
+[tool.setuptools]
+packages = ["iam_agent"]
