@@ -1,0 +1,29 @@
+# nginx front door for the IAM app (example -- adjust domains and paths)
+#
+# Get a certificate first, e.g.:  sudo certbot --nginx -d iam.example.com
+# The app binds 127.0.0.1:8000 and must never be exposed directly;
+# nginx is the only thing that talks TLS to the outside world.
+# When this is in place, set IAM_COOKIE_SECURE=1 so the session
+# cookie is only ever sent over HTTPS.
+
+server {
+    listen 443 ssl;
+    server_name iam.example.com;
+
+    ssl_certificate     /etc/letsencrypt/live/iam.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/iam.example.com/privkey.pem;
+    ssl_protocols TLSv1.2 TLSv1.3;
+
+    # Redirect plain HTTP to HTTPS.
+    # (Put this in a separate server block listening on port 80.)
+
+    location / {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # The app's pages are small; no need for large uploads.
+        client_max_body_size 1m;
+    }
+}

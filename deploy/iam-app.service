@@ -1,0 +1,34 @@
+# systemd service for the IAM app
+#
+# Install (adjust the paths and user first):
+#   sudo cp iam-app.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now iam-app
+#
+# The app itself binds 127.0.0.1:8000 by default; nginx (see
+# nginx.conf.example) terminates TLS in front of it. Secrets live in
+# /etc/iam-app/env (mode 600, owned by the service user), never in
+# this file and never in the repository.
+
+[Unit]
+Description=IAM on-boarding app
+After=network.target
+
+[Service]
+Type=simple
+User=iamapp
+Group=iamapp
+WorkingDirectory=/opt/iam-app
+EnvironmentFile=/etc/iam-app/env
+ExecStart=/usr/bin/python3 /opt/iam-app/run_app.py
+Restart=on-failure
+RestartSec=5
+# Hardening: the app needs nothing but its own directory and the
+# database file. Adjust ReadWritePaths to your install location.
+ProtectSystem=strict
+ReadWritePaths=/opt/iam-app
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
