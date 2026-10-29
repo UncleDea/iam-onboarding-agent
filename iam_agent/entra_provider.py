@@ -16,8 +16,7 @@ handled here. Configuration comes only from the environment:
                               in logs, never as a CLI argument)
     IAM_ENTRA_DOMAIN          e.g. maofu.onmicrosoft.com -- used to
                               build userPrincipalNames from usernames
-    IAM_ENTRA_TEMP_PASSWORD   temporary password for new accounts
-                              (forceChangePasswordNextSignIn is true)
+    IAM_ENTRA_USAGE_LOCATION  required ISO country code, e.g. US
     IAM_ENTRA_LICENSE_MAP     optional JSON: policy licence name ->
                               Graph skuPartNumber, e.g.
                               {"office-standard": "ENTERPRISEPACK"}
@@ -41,11 +40,14 @@ Deliberate choices, worth knowing before you run it:
 
 import json
 import os
+import secrets
+import string
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 
+from .providers import AlreadyExists, IdentityProvider, NotFound
 from .retry import TransientError
 
 GRAPH_BASE = "https://graph.microsoft.com/v1.0"
@@ -152,23 +154,25 @@ class GraphClient:
                 return exc.code, {}
 
 
-class EntraProvider:
+class EntraProvider(IdentityProvider):
     """Entra ID provider backed by Microsoft Graph."""
 
     def __init__(self, tenant_id: str, client_id: str, client_secret: str,
-                 domain: str, temp_password: str = None,
-                 license_map: dict = None, graph: GraphClient = None):
-        if not temp_password:
+                 domain: str, usage_location: str = "US",
+                 license_map: dict = None, graph: GraphClient = None,
+                 temp_password: str = None):
+        if not usage_location:
             raise ValueError(
-                "EntraProvider needs a temporary password for new accounts "
-                "(IAM_ENTRA_TEMP_PASSWORD); new accounts are created with "
-                "forceChangePasswordNextSignIn=true")
+                "EntraProvider needs IAM_ENTRA_USAGE_LOCATION "
+                "(for example US) before it can assign licences")
+        del temp_password
         self.domain = domain
-        self.temp_password = temp_password
+        self.usage_location = usage_location
         self.license_map = dict(license_map or {})
         self.graph = graph or GraphClient(tenant_id, client_id, client_secret)
         self._group_id_cache = {}
         self._sku_cache = None
+        self._passwords = {}
 
     @classmethod
     def from_env(cls, graph: GraphClient = None):
@@ -177,7 +181,7 @@ class EntraProvider:
         missing = [name for name in (
             "IAM_ENTRA_TENANT_ID", "IAM_ENTRA_CLIENT_ID",
             "IAM_ENTRA_CLIENT_SECRET", "IAM_ENTRA_DOMAIN",
-            "IAM_ENTRA_TEMP_PASSWORD") if not os.environ.get(name)]
+            "IAM_ENTRA_USAGE_LOCATION") if not os.environ.get(name)]
         if missing:
             raise ValueError(
                 "Entra provider missing environment variables: "
@@ -191,7 +195,7 @@ class EntraProvider:
             client_id=os.environ["IAM_ENTRA_CLIENT_ID"],
             client_secret=os.environ["IAM_ENTRA_CLIENT_SECRET"],
             domain=os.environ["IAM_ENTRA_DOMAIN"],
-            temp_password=os.environ["IAM_ENTRA_TEMP_PASSWORD"],
+            usage_location=os.environ["IAM_ENTRA_USAGE_LOCATION"],
             license_map=license_map,
             graph=graph,
         )
@@ -200,15 +204,17 @@ class EntraProvider:
 
     def create_user(self, hire) -> dict:
         upn = self._upn(hire.username)
+        password = self._new_password()
         body = {
-            "accountEnabled": True,
+            "accountEnabled": False,
             "displayName": hire.display_name,
             "mailNickname": hire.username.split("@")[0],
             "userPrincipalName": upn,
             "department": hire.department,
-            "jobTitle": hire.role,
+            "employeeType": hire.role,
+            "usageLocation": self.usage_location,
             "passwordProfile": {
-                "password": self.temp_password,
+                "password": password,
                 "forceChangePasswordNextSignIn": True,
             },
         }
@@ -216,34 +222,46 @@ class EntraProvider:
             created = self.graph.request("POST", "/users", body)
         except ValueError as exc:
             if "Request_ResourceAlreadyExists" in str(exc):
-                raise ValueError(
+                raise AlreadyExists(
                     f"user {hire.username!r} already exists") from None
             raise
+        self._passwords[hire.username] = password
+        if getattr(hire, "manager", ""):
+            manager_id = self._require_user_id(hire.manager)
+            user_id = created.get("id") or self._require_user_id(hire.username)
+            self.graph.request(
+                "PUT", f"/users/{user_id}/manager/$ref",
+                {"@odata.id": f"{GRAPH_BASE}/users/{manager_id}"})
         return self.get_user(hire.username) or {"id": created.get("id"),
                                                 "username": hire.username}
+
+    def take_temporary_password(self, username: str):
+        """Return the one-time password, once. It is not logged."""
+        return self._passwords.pop(username, None)
 
     def get_user(self, username: str):
         try:
             user = self.graph.request(
                 "GET",
                 f"/users/{self._upn(username)}?$select=id,displayName,"
-                "department,jobTitle,accountEnabled,assignedLicenses")
+                "department,employeeType,accountEnabled,assignedLicenses")
         except ValueError as exc:
             if "Request_ResourceNotFound" in str(exc):
                 return None
             raise
-        groups = [item["displayName"] for item in
-                  self.graph.get_all(
-                      f"/users/{user['id']}/memberOf?$select=displayName")
-                  if item.get("@odata.type") == "#microsoft.graph.group"]
+        direct = self._group_names(
+            f"/users/{user['id']}/memberOf?$select=displayName")
+        transitive = self._group_names(
+            f"/users/{user['id']}/transitiveMemberOf?$select=displayName")
         return {
             "username": username,
             "display_name": user["displayName"],
             "department": user.get("department") or "",
-            "role": user.get("jobTitle") or "",
+            "role": user.get("employeeType") or "",
             "manager": "",
             "active": bool(user.get("accountEnabled")),
-            "groups": sorted(groups),
+            "groups": sorted(direct),
+            "inherited_groups": sorted(set(transitive) - set(direct)),
             "licenses": sorted(
                 self._license_name(sku["skuId"])
                 for sku in user.get("assignedLicenses", [])),
@@ -255,16 +273,21 @@ class EntraProvider:
         if "department" in fields:
             body["department"] = fields["department"]
         if "role" in fields:
-            body["jobTitle"] = fields["role"]
+            body["employeeType"] = fields["role"]
         if body:
             self.graph.request("PATCH", f"/users/{user_id}", body)
 
     def add_to_group(self, username: str, group: str) -> None:
         user_id = self._require_user_id(username)
         group_id = self._group_id(group)
-        self.graph.request(
-            "POST", f"/groups/{group_id}/members/$ref",
-            {"@odata.id": f"{GRAPH_BASE}/users/{user_id}"})
+        try:
+            self.graph.request(
+                "POST", f"/groups/{group_id}/members/$ref",
+                {"@odata.id": f"{GRAPH_BASE}/users/{user_id}"})
+        except ValueError as exc:
+            if "already exist" in str(exc).lower():
+                return
+            raise
 
     def remove_from_group(self, username: str, group: str) -> None:
         user_id = self._require_user_id(username)
@@ -291,23 +314,30 @@ class EntraProvider:
         self.graph.request("PATCH", f"/users/{user_id}",
                            {"accountEnabled": False})
 
+    def enable_user(self, username: str) -> None:
+        user_id = self._require_user_id(username)
+        self.graph.request("PATCH", f"/users/{user_id}",
+                           {"accountEnabled": True})
+
     def list_users(self) -> list:
         users = self.graph.get_all(
-            "/users?$select=id,displayName,department,jobTitle,"
+            "/users?$select=id,displayName,department,employeeType,"
             "accountEnabled,assignedLicenses&$top=100")
         result = []
         for user in users:
-            groups = [item["displayName"] for item in
-                      self.graph.get_all(
-                          f"/users/{user['id']}/memberOf?$select=displayName")
-                      if item.get("@odata.type") == "#microsoft.graph.group"]
+            direct = self._group_names(
+                f"/users/{user['id']}/memberOf?$select=displayName")
+            transitive = self._group_names(
+                f"/users/{user['id']}/transitiveMemberOf"
+                "?$select=displayName")
             result.append({
                 "username": user.get("userPrincipalName", ""),
                 "display_name": user["displayName"],
                 "department": user.get("department") or "",
-                "role": user.get("jobTitle") or "",
+                "role": user.get("employeeType") or "",
                 "active": bool(user.get("accountEnabled")),
-                "groups": sorted(groups),
+                "groups": sorted(direct),
+                "inherited_groups": sorted(set(transitive) - set(direct)),
                 "licenses": sorted(
                     self._license_name(sku["skuId"])
                     for sku in user.get("assignedLicenses", [])),
@@ -328,20 +358,39 @@ class EntraProvider:
                 f"/users/{self._upn(username)}?$select=id")
         except ValueError as exc:
             if "Request_ResourceNotFound" in str(exc):
-                raise ValueError(f"unknown user {username!r}") from None
+                raise NotFound(f"unknown user {username!r}") from None
             raise
         return user["id"]
 
     def _group_id(self, display_name: str) -> str:
         if display_name not in self._group_id_cache:
+            safe = display_name.replace("'", "''")
             groups = self.graph.get_all(
                 "/groups?$filter=" + urllib.parse.quote(
-                    f"displayName eq '{display_name}'")
+                    f"displayName eq '{safe}'")
                 + "&$select=id")
-            if not groups:
-                raise ValueError(f"unknown group {display_name!r}")
+            if len(groups) != 1:
+                raise ValueError(
+                    f"group {display_name!r} matched {len(groups)} groups; "
+                    "a name must match exactly one")
             self._group_id_cache[display_name] = groups[0]["id"]
         return self._group_id_cache[display_name]
+
+    def _group_names(self, path: str) -> list:
+        try:
+            items = self.graph.get_all(path)
+        except ValueError as exc:
+            if "Request_ResourceNotFound" in str(exc):
+                return []
+            raise
+        return [item["displayName"] for item in items
+                if item.get("@odata.type") == "#microsoft.graph.group"
+                and item.get("displayName")]
+
+    def _new_password(self) -> str:
+        alphabet = string.ascii_letters + string.digits
+        body = "".join(secrets.choice(alphabet) for _ in range(24))
+        return body + "aA1!"
 
     def _subscribed_skus(self) -> list:
         if self._sku_cache is None:

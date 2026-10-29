@@ -22,12 +22,11 @@ Welcome emails use the sender from iam_agent.emailing: SMTP when
 IAM_SMTP_* is set, console output when IAM_EMAIL_CONSOLE=1, and
 skipped otherwise.
 
---auto-approve skips the human prompt. It exists for scripted tests
-only and prints a loud warning: a real deployment must never run
-unattended against a real provider. Off-board and move operations
-always ask a human directly (bypassing the auto-approval router),
-because removing or changing access is the operation most worth a
-second pair of eyes -- unless --auto-approve is explicitly given.
+--requester and --approver name two different app users. The
+approver is looked up in the app's user table; the role stored
+there is the role used. A standard change needs an approver or
+admin. A privileged change needs an admin. --dry-run prints the
+plan and writes nothing, and does not need either name.
 """
 
 import argparse
@@ -36,14 +35,19 @@ import json
 import logging
 import sys
 
-from .approval import make_approver, terminal_human_approver
 from .audit_store import SqliteAuditStore
+from .auth import AuthStore
+from .db import Database
 from .emailing import email_sender_from_env
 from .engine import OnboardingAgent
 from .entra_provider import EntraProvider
+from .migrations import migrate
 from .models import NewHire
 from .notifiers import ConsoleNotifier
+from .policies import load_policy
 from .providers import MockProvider
+from .requests import RequestStore
+from .service import IAMService
 from .sqlite_provider import SqliteProvider
 
 _DEMO_HIRES = [
@@ -86,8 +90,9 @@ def build_parser() -> argparse.ArgumentParser:
                         help="SQLite file for --provider sqlite and the audit store")
     parser.add_argument("--dry-run", action="store_true",
                         help="print plans, change nothing")
-    parser.add_argument("--auto-approve", action="store_true",
-                        help="skip the human prompt for on-boarding (tests only)")
+    parser.add_argument("--approver", default=None,
+                        help="app user who approves (looked up; cannot "
+                             "be the requester)")
     parser.add_argument("--audit-file", default=None,
                         help="append audit entries as JSON lines to this file")
     parser.add_argument("--audit-db", action="store_true",
@@ -163,12 +168,9 @@ def main(argv=None) -> int:
         return 0
 
     if args.report:
-        from .db import Database
-        from .migrations import migrate
         from .reporting import (access_report, activity_report,
                                 approval_report, summary_report, to_csv,
                                 to_json)
-        from .requests import RequestStore
         db = Database(args.db)
         migrate(db)
         reports = {
@@ -188,59 +190,130 @@ def main(argv=None) -> int:
             print(to_json(report))
         return 0
 
-    # On-boarding may auto-approve in tests. Move/offboard always ask a
-    # human directly, bypassing the router's auto-approval path.
-    if args.auto_approve:
-        print("WARNING: --auto-approve: running without human approval. "
-              "Tests only; never use this against a real provider.")
-        approver = make_approver(lambda p, h: True, human_name="auto")
-    elif args.offboard or args.move:
-        approver = terminal_human_approver
-    else:
-        approver = make_approver(terminal_human_approver,
-                                 human_name="terminal-user")
-    agent = OnboardingAgent(provider, approver=approver,
-                            audit_file=args.audit_file,
-                            audit_store=audit_store, notifier=notifier,
-                            email_sender=email_sender_from_env())
+    policy = load_policy()
+    if args.dry_run:
+        agent = OnboardingAgent(
+            provider, policy=policy, audit_file=args.audit_file,
+            audit_store=audit_store, notifier=notifier,
+            email_sender=email_sender_from_env())
+        return _run_direct(args, agent, provider, audit_store)
 
+    if not args.requester or not args.approver:
+        print("error: --requester and --approver are required")
+        _close_runtime(args, provider, audit_store)
+        return 2
+    db = Database(args.db)
+    migrate(db)
+    auth = AuthStore(db)
+    approver_row = auth.get_user(args.approver)
+    if approver_row is None or not approver_row["active"]:
+        print(f"error: approver {args.approver!r} is not an active app user")
+        db.close()
+        _close_runtime(args, provider, audit_store)
+        return 2
+    service = IAMService(
+        provider, audit_store=audit_store, audit_file=args.audit_file,
+        request_store=RequestStore(db),
+        notifier=notifier, email_sender=email_sender_from_env(),
+        policy=policy)
+    service.recover_interrupted()
+    try:
+        return _run_through_service(
+            args, service, approver_row["role"])
+    finally:
+        db.close()
+        _close_runtime(args, provider, audit_store)
+
+
+def _close_runtime(args, provider, audit_store) -> None:
+    if audit_store is not None:
+        audit_store.close()
+    if args.provider == "sqlite":
+        provider.close()
+
+
+def _print_plan(username, result) -> None:
+    print(f"  [{username}] status: {result['status']}")
+    for step in result.get("planned") or []:
+        description = getattr(step, "description", None) or step.get(
+            "description", "")
+        print(f"    - {description}")
+
+
+def _run_direct(args, agent, provider, audit_store) -> int:
     try:
         if args.offboard:
-            result = agent.offboard(args.offboard, dry_run=args.dry_run,
-                                    requester=args.requester)
-            print(f"  [{args.offboard}] offboard status: {result['status']}")
-            return 0 if result["status"] in ("done", "dry-run") else 1
+            result = agent.offboard(args.offboard, dry_run=True)
+            _print_plan(args.offboard, result)
+            return 0
         if args.move:
             if not args.new_role:
                 print("--move needs --new-role")
                 return 2
-            result = agent.move(args.move, args.new_role,
-                                dry_run=args.dry_run,
-                                requester=args.requester)
-            print(f"  [{args.move}] move status: {result['status']}")
-            return 0 if result["status"] in ("done", "dry-run") else 1
-
+            result = agent.move(args.move, args.new_role, dry_run=True)
+            _print_plan(args.move, result)
+            return 0
         hires = load_hires_csv(args.hires) if args.hires else _DEMO_HIRES
         overall_ok = True
         for hire in hires:
             try:
-                result = agent.run(hire, dry_run=args.dry_run,
-                                   requester=args.requester)
+                result = agent.run(hire, dry_run=True)
             except ValueError as exc:
-                # Plan-time refusal (e.g. segregation-of-duties
-                # conflict): nothing was created, and the reason is
-                # the whole point.
                 print(f"  [{hire.username}] REFUSED: {exc}")
                 overall_ok = False
                 continue
-            print(f"  [{hire.username}] status: {result['status']}")
-            overall_ok = overall_ok and result["status"] in ("done", "dry-run")
+            _print_plan(hire.username, result)
+            overall_ok = overall_ok and result["status"] == "dry-run"
         return 0 if overall_ok else 1
     finally:
-        if audit_store is not None:
-            audit_store.close()
-        if args.provider == "sqlite":
-            provider.close()
+        _close_runtime(args, provider, audit_store)
+
+
+def _run_through_service(args, service, approver_role) -> int:
+    try:
+        if args.offboard:
+            request = service.submit_offboard(args.offboard, args.requester)
+            finished = service.approve(request["id"], args.approver,
+                                       approver_role)
+            print(f"  [{args.offboard}] offboard status: "
+                  f"{finished['status']}")
+            return 0 if finished["status"] == "done" else 1
+        if args.move:
+            if not args.new_role:
+                print("--move needs --new-role")
+                return 2
+            request = service.submit_move(
+                args.move, args.new_role, args.requester)
+            finished = service.approve(request["id"], args.approver,
+                                       approver_role)
+            print(f"  [{args.move}] move status: {finished['status']}")
+            return 0 if finished["status"] == "done" else 1
+        hires = load_hires_csv(args.hires) if args.hires else _DEMO_HIRES
+        overall_ok = True
+        for hire in hires:
+            try:
+                request = service.submit_onboard({
+                    "first_name": hire.first_name,
+                    "last_name": hire.last_name,
+                    "username": hire.username,
+                    "department": hire.department,
+                    "role": hire.role,
+                    "manager": hire.manager,
+                    "start_date": hire.start_date,
+                    "email": hire.email,
+                }, args.requester)
+                finished = service.approve(
+                    request["id"], args.approver, approver_role)
+            except ValueError as exc:
+                print(f"  [{hire.username}] REFUSED: {exc}")
+                overall_ok = False
+                continue
+            print(f"  [{hire.username}] status: {finished['status']}")
+            overall_ok = overall_ok and finished["status"] == "done"
+        return 0 if overall_ok else 1
+    except ValueError as exc:
+        print(f"error: {exc}")
+        return 1
 
 
 if __name__ == "__main__":

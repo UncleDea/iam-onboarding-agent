@@ -5,13 +5,24 @@ Google Workspace, Okta, or a plain database. The engine only ever talks
 to this interface, so swapping the system underneath means writing one
 new class, not rewriting the agent.
 
-MockProvider is a fake provider that keeps everything in memory. It lets
-you run and test the whole agent with zero accounts, credentials, or
-network access. Replace it with a real provider when you are ready (see
-examples/entra_provider_stub.py for the shape of one).
+MockProvider keeps everything in memory and exists for tests. The
+built-in directory is SqliteProvider. The Microsoft directory is
+EntraProvider in entra_provider.py.
 """
 
 from abc import ABC, abstractmethod
+
+
+class ProviderError(Exception):
+    """A provider refused an operation for a reason that will not change."""
+
+
+class AlreadyExists(ProviderError):
+    """The account is already in the directory."""
+
+
+class NotFound(ProviderError):
+    """The account, group, or licence is not in the directory."""
 
 
 class IdentityProvider(ABC):
@@ -19,7 +30,7 @@ class IdentityProvider(ABC):
 
     @abstractmethod
     def create_user(self, hire) -> dict:
-        """Create the account. Returns the created user record."""
+        """Create the account disabled. Returns the created user record."""
 
     @abstractmethod
     def get_user(self, username: str):
@@ -31,7 +42,7 @@ class IdentityProvider(ABC):
 
     @abstractmethod
     def add_to_group(self, username: str, group: str) -> None:
-        """Add an existing user to a group."""
+        """Add an existing user to a group. Already a member is success."""
 
     @abstractmethod
     def remove_from_group(self, username: str, group: str) -> None:
@@ -39,7 +50,7 @@ class IdentityProvider(ABC):
 
     @abstractmethod
     def assign_license(self, username: str, license_name: str) -> None:
-        """Give an existing user a licence."""
+        """Give an existing user a licence. Already held is success."""
 
     @abstractmethod
     def revoke_license(self, username: str, license_name: str) -> None:
@@ -47,7 +58,11 @@ class IdentityProvider(ABC):
 
     @abstractmethod
     def disable_user(self, username: str) -> None:
-        """Disable an account (the first step of off-boarding)."""
+        """Disable an account. Already disabled is success."""
+
+    @abstractmethod
+    def enable_user(self, username: str) -> None:
+        """Enable an account. Already enabled is success."""
 
 
 class MockProvider(IdentityProvider):
@@ -59,7 +74,7 @@ class MockProvider(IdentityProvider):
 
     def create_user(self, hire) -> dict:
         if hire.username in self.users:
-            raise ValueError(f"user {hire.username!r} already exists")
+            raise AlreadyExists(f"user {hire.username!r} already exists")
         record = {
             "id": f"user-{self._next_id:03d}",
             "username": hire.username,
@@ -69,7 +84,7 @@ class MockProvider(IdentityProvider):
             "manager": hire.manager,
             "groups": [],
             "licenses": [],
-            "active": True,
+            "active": False,
         }
         self._next_id += 1
         self.users[hire.username] = record
@@ -107,6 +122,9 @@ class MockProvider(IdentityProvider):
     def disable_user(self, username: str) -> None:
         self._get(username)["active"] = False
 
+    def enable_user(self, username: str) -> None:
+        self._get(username)["active"] = True
+
     def list_users(self) -> list:
         return list(self.users.values())
 
@@ -114,4 +132,4 @@ class MockProvider(IdentityProvider):
         try:
             return self.users[username]
         except KeyError:
-            raise ValueError(f"unknown user {username!r}") from None
+            raise NotFound(f"unknown user {username!r}") from None

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "iam-onboarding-agent"
-version = "0.7.0"
+version = "1.0.0"
 description = "Provider-general IAM on-boarding agent: plan, approve, execute, audit."
 requires-python = ">=3.10"
 

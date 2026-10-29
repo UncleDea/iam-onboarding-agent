@@ -85,6 +85,18 @@ class TestWebApp(unittest.TestCase):
 
         # Alice submits an on-boarding request.
         alice = self._login("alice", "alice-password")
+        status, _, dash, _ = http_request(self.port, "GET", "/dashboard",
+                                          cookie=alice)
+        self.assertIn("href='/dashboard' aria-current='page'", dash)
+        self.assertNotIn("href='/requests' aria-current", dash)
+        status, _, listing, _ = http_request(self.port, "GET", "/requests",
+                                             cookie=alice)
+        self.assertIn("href='/requests' aria-current='page'", listing)
+        self.assertNotIn("href='/dashboard' aria-current", listing)
+        status, _, pending, _ = http_request(
+            self.port, "GET", "/requests?status=pending_approval",
+            cookie=alice)
+        self.assertIn('pending_approval" aria-current=\'page\'', pending)
         csrf = self._csrf(alice)
         body = urllib.parse.urlencode({
             "csrf_token": csrf, "kind": "onboard",
@@ -120,6 +132,27 @@ class TestWebApp(unittest.TestCase):
                                             cookie=boss)
         self.assertEqual(status, 200)
         self.assertIn("ada.lovelace", review)
+
+        status, _, groups, _ = http_request(self.port, "GET", "/groups",
+                                            cookie=alice)
+        self.assertEqual(status, 200)
+        self.assertIn("href='/groups' aria-current='page'", groups)
+        self.assertIn(">managers</td><td>yes</td>", groups)
+        self.assertIn(">analysts</td><td></td><td></td><td></td>", groups)
+        self.assertIn(">engineering</td><td></td><td>ada.lovelace</td>",
+                      groups)
+        status, _, denied, _ = http_request(
+            self.port, "POST", "/groups",
+            body=urllib.parse.urlencode({
+                "csrf_token": csrf, "group": "managers",
+                "username": "ada.lovelace"}),
+            cookie=boss)
+        self.assertEqual(status, 404)
+        status, _, review, _ = http_request(self.port, "GET", "/review",
+                                            cookie=boss)
+        self.assertIn("engineering", review)
+        self.assertNotIn(">managers</td><td>yes</td><td>ada.lovelace</td>",
+                         review)
 
         # Metrics and reports work.
         status, _, metrics, _ = http_request(self.port, "GET", "/metrics",

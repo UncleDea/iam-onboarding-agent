@@ -62,18 +62,19 @@ class RequestStore:
 
     def decide(self, request_id: int, approver: str, approved: bool,
                reason: str = "") -> dict:
-        request = self.get(request_id)
-        if request is None:
-            raise ValueError(f"unknown request {request_id}")
-        if request["status"] != "pending_approval":
-            raise ValueError(
-                f"request {request_id} is {request['status']}, "
-                "not pending approval")
-        self._db.execute(
+        cursor = self._db.execute(
             "UPDATE requests SET status = ?, approver = ?,"
-            "  decision_reason = ?, decided_at = ? WHERE id = ?",
-            ("approved" if approved else "rejected", approver, reason,
+            "  decision_reason = ?, decided_at = ?"
+            " WHERE id = ? AND status = 'pending_approval'",
+            ("running" if approved else "rejected", approver, reason,
              _now(), request_id))
+        if cursor.rowcount != 1:
+            current = self.get(request_id)
+            if current is None:
+                raise ValueError(f"unknown request {request_id}")
+            raise ValueError(
+                f"request {request_id} is {current['status']}, "
+                "not pending approval")
         return self.get(request_id)
 
     def mark_running(self, request_id: int) -> dict:

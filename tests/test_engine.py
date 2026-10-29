@@ -1,10 +1,9 @@
 import json
 import tempfile
 import unittest
-from unittest import mock
 
 from iam_agent import MockProvider, NewHire, OnboardingAgent
-from iam_agent import policies
+from iam_agent.policies import load_policy
 
 
 def hire(username="ada.lovelace", role="engineer"):
@@ -33,24 +32,34 @@ class TestEngine(unittest.TestCase):
         self.assertEqual(agent.provider.users, {})
         self.assertEqual(agent.audit[-1].status, "rejected")
 
-    def test_rerun_resumes_idempotently(self):
+    def test_rerun_of_an_active_account_is_refused(self):
         agent = OnboardingAgent(MockProvider(), approver=lambda p, h: True)
         agent.run(hire())
-        result = agent.run(hire())  # second on-boarding of same person
-        self.assertEqual(result["status"], "done")
+        result = agent.run(hire())
+        self.assertEqual(result["status"], "failed")
         self.assertEqual(len(agent.provider.users), 1)
-        skipped = [e for e in agent.audit
-                   if e.action == "create_user" and e.status == "skipped"]
-        self.assertEqual(len(skipped), 1)
+        self.assertTrue(agent.provider.users["ada.lovelace"]["active"])
+        self.assertIn("engineering",
+                      agent.provider.users["ada.lovelace"]["groups"])
+
+    def test_disabled_account_can_be_resumed(self):
+        provider = MockProvider()
+        provider.create_user(hire())
+        agent = OnboardingAgent(provider, approver=lambda p, h: True)
+        result = agent.run(hire())
+        self.assertEqual(result["status"], "done")
+        user = provider.users["ada.lovelace"]
+        self.assertTrue(user["active"])
+        self.assertIn("engineering", user["groups"])
 
     def test_sod_conflict_refuses_before_any_side_effect(self):
-        with mock.patch.dict(policies.ROLE_ACCESS, {
+        policy = load_policy().with_roles({
             "treasurer": {"groups": ["payment-create", "payment-approve"],
                           "licenses": []},
-        }):
-            agent = OnboardingAgent(MockProvider())
-            with self.assertRaises(ValueError):
-                agent.run(hire(role="treasurer"))
+        })
+        agent = OnboardingAgent(MockProvider(), policy=policy)
+        with self.assertRaises(ValueError):
+            agent.run(hire(role="treasurer"))
         self.assertEqual(agent.provider.users, {})
 
     def test_audit_file_gets_json_lines(self):
@@ -66,6 +75,25 @@ class TestEngine(unittest.TestCase):
                    if line["action"] == "create_user"]
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0]["status"], "done")
+
+    def test_run_without_approver_creates_nothing(self):
+        agent = OnboardingAgent(MockProvider())
+        result = agent.run(hire())
+        self.assertEqual(result["status"], "rejected")
+        self.assertEqual(agent.provider.users, {})
+
+    def test_move_refuses_a_segregation_conflict(self):
+        policy = load_policy().with_roles({
+            "treasurer": {"groups": ["payment-create", "payment-approve"],
+                          "licenses": []},
+        })
+        agent = OnboardingAgent(MockProvider(), approver=lambda p, h: True,
+                                policy=policy)
+        agent.run(hire())
+        with self.assertRaises(ValueError):
+            agent.move("ada.lovelace", "treasurer")
+        self.assertIn("engineering",
+                      agent.provider.users["ada.lovelace"]["groups"])
 
 
 if __name__ == "__main__":

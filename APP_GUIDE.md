@@ -1,113 +1,100 @@
-# The IAM app — user guide
+# Operate IAM Onboarding
 
-The app is a small web interface over the IAM engine. It runs on one
-machine, serves one team, and needs nothing but Python 3.10+.
+One machine, one company, Python 3.10 or newer. Nothing else to install.
 
-## Start it
+## Start
 
 ```bash
 python run_app.py
 ```
 
-Then open http://127.0.0.1:8000/ in a browser.
+Open http://127.0.0.1:8000/.
 
-On first start, with no app users yet, the app creates a bootstrap
-admin and prints its password **once** to the console. To control
-the admin account instead, set these before starting:
+The first visit, when no app user exists, is setup. Enter the company name, an admin, and a different approver. Passwords are at least 12 characters. The app does not print a password.
+
+To create the admin from the environment instead:
 
 ```bash
 export IAM_APP_ADMIN_USER="admin"
-export IAM_APP_ADMIN_PASSWORD="choose-a-strong-password"
+export IAM_APP_ADMIN_PASSWORD="a-long-password"
 ```
 
-Configuration lives in the environment; see `iam_agent/config.py`
-for the full list (`IAM_PROVIDER`, `IAM_DB`, `IAM_APP_HOST`,
-`IAM_APP_PORT`, `IAM_ENTRA_*`, ...). Defaults: SQLite provider,
-database file `iam.db`, bind 127.0.0.1:8000.
+Then create the approver on the Users page. Two people are required. One person cannot approve their own request, and there is no override.
+
+Other settings are in `iam_agent/config.py`. Defaults: built-in directory, database file `iam.db`, bind 127.0.0.1:8000.
 
 ## Who can do what
 
-App users are separate from directory users. Roles:
+App users are separate from directory users.
 
-- **requester** — submit on-board, move, and off-board requests.
-- **approver** — approve or reject requests (never their own).
-- **admin** — everything, including approvals.
+- **requester** — submit onboarding, move, and offboard requests.
+- **approver** — decide a standard request, never their own.
+- **admin** — decide any request, never their own, and manage users and policy.
 
-There is no self-service signup page, deliberately: admins create
-app users on the **Users** page (admin role only), where they can
-also activate/deactivate accounts and reset passwords. Every admin
-action is written to the audit store. Users change their own
-password on the **Profile** page; changing a password signs out
-all sessions for that user.
+A standard grant or an offboard needs an approver or an admin. A privileged grant needs an admin. Privileged means a role, group, or licence listed as privileged in the policy, or a role the policy does not name.
 
-Failed logins lock an account for 15 minutes after 5 attempts
-(both configurable), and one IP address is throttled after 20
-failed logins in 15 minutes. Login failures show the same generic
-message whether the account is unknown, inactive, or locked, so
-failures never reveal which one it was.
+Admins create app users on the Users page, and can deactivate accounts and reset passwords. Those actions are in the audit log. A person changes their own password on Profile. That signs out every session for that user.
+
+Five failed logins lock an account for 15 minutes. One address is throttled after 20 failed logins in 15 minutes. Both are configurable. A failed login looks the same for an unknown, inactive, or locked account.
 
 ## The workflow
 
-1. A requester submits a request (on-board, move, or off-board).
-   It sits in **pending_approval**.
-2. An approver (or admin) who is not the requester opens it, sees
-   the exact details, and approves or rejects with a reason.
-3. Approving runs the change immediately through the engine, with
-   the same audit trail, retries, and compensation as the CLI.
-4. A rejected request changes nothing; the reason is recorded.
+1. A requester submits a request. The plan is stored with it.
+2. A person who is allowed to decide opens it, reads the plan, and approves or rejects.
+3. Approval runs that stored plan. If the policy has changed so the plan would differ, the request stays pending.
+4. A rejection changes nothing. The reason is recorded.
 
-## Welcome emails
+Onboarding creates the account disabled, adds groups and licences, then enables it. The welcome message is outside that sequence: a missing address or a failed send does not undo the account.
 
-The last step of on-boarding sends a welcome email to the hire's
-email address (optional field on the request form and in the CSV).
-The email contains the hire's name, username, department, role,
-manager, and start date -- never a password.
+A move records the previous groups, licences, role, and department, and restores them if a later step fails. If the restore itself fails, the request is marked partial. An offboard disables the account first. Groups the person inherited are recorded and left in place.
 
-Configuration (environment):
+When the directory is Entra, the one-time password is shown once on the request page and is not written to the audit log, the welcome mail, or the stored result.
 
-- `IAM_SMTP_HOST`, `IAM_SMTP_PORT` (default 587), `IAM_SMTP_USER`,
-  `IAM_SMTP_PASSWORD`, and `IAM_WELCOME_FROM` (or `IAM_NOTIFY_FROM`)
-  for real sending.
-- `IAM_EMAIL_CONSOLE=1` to print emails to the console instead
-  (demos only).
+## Policy
 
-If no address is on file, or no sender is configured, the step is
-logged as **skipped** -- never failed. If sending itself fails,
-the step is logged as **failed** but the on-boarding is not rolled
-back: a failed email must not undo a correctly created account.
+The Policy page is for admins. It shows the policy file the process loaded. Saving uses the same checks as startup. A bad document is refused and the file is left as it was.
+
+## Sample company
+
+On the built-in directory, an admin can load three fictional people from Access review. That button is absent when the directory is Entra.
+
+## Welcome email
+
+The welcome step uses the hire's email address. The message has the name, username, department, role, manager, and start date. It never has a password.
+
+- `IAM_SMTP_HOST`, `IAM_SMTP_PORT` (default 587), `IAM_SMTP_USER`, `IAM_SMTP_PASSWORD`, and `IAM_WELCOME_FROM` (or `IAM_NOTIFY_FROM`) send mail.
+- `IAM_EMAIL_CONSOLE=1` prints the message instead.
+
+No address, or no sender, is logged as skipped. A send failure is logged as failed and the account stays.
+
+## Sign in with Microsoft
+
+Optional, and separate from the directory connector. Set `IAM_APP_ENTRA_TENANT`, `IAM_APP_ENTRA_CLIENT_ID`, and `IAM_APP_ENTRA_CLIENT_SECRET`. `IAM_APP_ENTRA_REDIRECT` defaults to `http://<host>:<port>/login/microsoft/callback`.
+
+The sign-in matches an existing app username, or the part of the Microsoft account name before `@`. It does not create users. Username and password stay available.
 
 ## Pages
 
 - **Dashboard** — pending approvals, totals, recent requests, alerts.
-- **Requests** — list with status filters; each request has a
-  detail page with its payload, decision, and result.
-- **New request** — one form per kind (on-board / move / off-board).
-- **Access review** — every directory user with groups and licences.
-- **Reports** — summary, access, activity, and approval reports,
-  viewable as JSON or downloadable as CSV.
-- **Audit** — the most recent audit entries.
-- **Health** (`/health`, no login) — database, audit chain, and
-  provider status as JSON. Point a monitor at it.
-- **Metrics** (`/metrics`, login required) — run/decision counters
-  and run durations as JSON.
+- **Requests** — list and detail, including the frozen plan.
+- **New request** — onboard, move, or offboard.
+- **Access review** — directory users, groups, and licences.
+- **Reports** — summary, access, activity, and approvals, on the page or as CSV.
+- **Audit** — recent audit entries.
+- **Policy** — admin only.
+- **Users** — admin only.
+- **Profile** — your password.
+- **Health** (`/health`, no login) — the database answers, and Entra can obtain a token when that directory is configured. It does not list users or replay the audit chain. Use `--verify-audit` for the chain.
+- **Metrics** (`/metrics`, login required) — counters and durations.
 
-## Observability, monitoring, reporting
+## Logs and reports
 
-- **Logs**: plain text by default; set `IAM_LOG_JSON=1` for JSON
-  lines (one per line, with a request ID per web request) for a
-  log aggregator.
-- **Monitoring**: poll `/health`. A partial or failed run also
-  raises an alert inside the app (dashboard count) and calls the
-  notifier, at most once per user per 15 minutes.
-- **Reporting**: the Reports page, or the CLI:
-  `python -m iam_agent.cli --provider sqlite --db iam.db --report
-  summary --format csv`.
+Set `IAM_LOG_JSON=1` for one JSON line per event, with a request id on web requests. A partial or failed run alerts inside the app and calls the notifier, at most once per person per 15 minutes.
 
-## Running it beyond one machine
+```bash
+python -m iam_agent.cli --provider sqlite --db iam.db --report summary --format csv
+```
 
-This app is single-process with SQLite — right for a small team
-on one server. See [DEPLOYMENT.md](sandbox://workspace/iam-onboarding-agent/DEPLOYMENT.md) for the full checklist: systemd
-service, nginx + TLS, an env file for secrets, nightly backups
-with restore proof, log shipping, and alert wiring. For multiple
-servers or a larger team, move the database layer to PostgreSQL
-(the `Database` class is the seam).
+## Beyond one machine
+
+This app is one process and one SQLite file, which is the right size for a small team on one server. See [DEPLOYMENT.md](DEPLOYMENT.md).

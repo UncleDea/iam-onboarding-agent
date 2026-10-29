@@ -6,7 +6,7 @@ allowed to submit and approve requests. Keeping them separate is
 deliberate: the app must work (and be administrable) even if the
 directory is unreachable.
 
-- Passwords are hashed with PBKDF2-HMAC-SHA256 (200k iterations, a
+- Passwords are hashed with PBKDF2-HMAC-SHA256 (600k iterations, a
   fresh 16-byte salt per password). Only hashes are stored.
 - Sessions are random tokens stored server-side with an expiry.
   The browser cookie holds only the token, never identity or roles.
@@ -16,7 +16,7 @@ directory is unreachable.
 - Lockout: after N failed logins (default 5), the account locks for
   M minutes (default 15). Lockout is per account, so guessing one
   password cannot lock out everyone.
-- Password policy: at least 8 characters, enforced on creation,
+- Password policy: at least 12 characters, enforced on creation,
   reset, and change. Changing or resetting a password invalidates
   every existing session for that user.
 """
@@ -29,12 +29,24 @@ from datetime import datetime, timedelta, timezone
 
 ROLES = ("admin", "approver", "requester")
 
-_ITERATIONS = 200_000
-MIN_PASSWORD_LENGTH = 8
+_ITERATIONS = 600_000
+MIN_PASSWORD_LENGTH = 12
 
 
 def _now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def get_meta(db, key: str, default: str = "") -> str:
+    row = db.query_one("SELECT value FROM app_meta WHERE key = ?", (key,))
+    return row["value"] if row else default
+
+
+def set_meta(db, key: str, value: str) -> None:
+    db.execute(
+        "INSERT INTO app_meta (key, value) VALUES (?, ?) "
+        "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        (key, value))
 
 
 def hash_password(password: str) -> str:
@@ -43,6 +55,9 @@ def hash_password(password: str) -> str:
                                  salt, _ITERATIONS)
     return (f"pbkdf2_sha256${_ITERATIONS}${salt.hex()}"
             f"${digest.hex()}")
+
+
+_DUMMY_HASH = hash_password("not-a-real-password")
 
 
 def verify_password(password: str, stored: str) -> bool:
@@ -159,7 +174,11 @@ class AuthStore:
         row = self._db.query_one(
             "SELECT username, password_hash, role, active, locked_until"
             " FROM app_users WHERE username = ?", (username,))
-        if row is None or not row["active"]:
+        if row is None:
+            verify_password(password, _DUMMY_HASH)
+            return None
+        if not row["active"]:
+            verify_password(password, row["password_hash"])
             return None
         if row.get("locked_until") and row["locked_until"] > _now():
             return None
@@ -169,6 +188,23 @@ class AuthStore:
         self._db.execute(
             "UPDATE app_users SET failed_attempts = 0, locked_until = NULL"
             " WHERE username = ?", (username,))
+        return self._issue_session(username)
+
+    def start_session(self, username: str):
+        """Open a session for a person Microsoft has already identified.
+
+        Refuses an unknown or inactive account. It does not create users.
+        """
+        row = self._db.query_one(
+            "SELECT username, active, locked_until FROM app_users "
+            "WHERE username = ?", (username,))
+        if row is None or not row["active"]:
+            return None
+        if row.get("locked_until") and row["locked_until"] > _now():
+            return None
+        return self._issue_session(username)
+
+    def _issue_session(self, username: str) -> str:
         token = secrets.token_urlsafe(32)
         csrf = secrets.token_urlsafe(24)
         expires = (datetime.now(timezone.utc)
@@ -185,7 +221,7 @@ class AuthStore:
         row = self._db.query_one(
             "SELECT s.username, s.csrf_token, s.expires_at, u.role"
             " FROM sessions s JOIN app_users u ON u.username = s.username"
-            " WHERE s.token = ?", (token,))
+            " WHERE s.token = ? AND u.active = 1", (token,))
         if row is None or row["expires_at"] <= _now():
             return None
         return {"username": row["username"], "role": row["role"],

@@ -20,8 +20,9 @@ In the Microsoft Entra admin center, or the Azure portal:
 2. Name it something clear, e.g. `iam-onboarding-agent`.
 3. Supported account types: **Accounts in this organizational
    directory only**.
-4. No redirect URI is needed: this app uses the client-credentials
-   flow (app-only, no user sign-in).
+4. No redirect URI is needed for the directory connector: it uses
+   the client-credentials flow. Sign-in with Microsoft, if you want
+   it, is a different app registration. See APP_GUIDE.md.
 
 ## 2. Grant least-privilege API permissions
 
@@ -59,7 +60,7 @@ export IAM_ENTRA_TENANT_ID="your-tenant.onmicrosoft.com"  # or the tenant GUID
 export IAM_ENTRA_CLIENT_ID="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx"
 export IAM_ENTRA_CLIENT_SECRET="the secret from step 3"
 export IAM_ENTRA_DOMAIN="your-tenant.onmicrosoft.com"
-export IAM_ENTRA_TEMP_PASSWORD="a temporary password meeting your tenant policy"
+export IAM_ENTRA_USAGE_LOCATION="US"
 # Optional: map policy licence names to Graph skuPartNumbers
 export IAM_ENTRA_LICENSE_MAP='{"office-standard": "ENTERPRISEPACK"}'
 ```
@@ -69,11 +70,17 @@ Notes:
 - `IAM_ENTRA_DOMAIN` builds userPrincipalNames: username
   `ada.lovelace` becomes `ada.lovelace@your-tenant.onmicrosoft.com`.
   A username that already contains `@` is used as-is.
-- New accounts are created with
-  `forceChangePasswordNextSignIn=true`, so the temporary password
-  is single-use by design. For a production rollout, prefer the
-  invitation or self-service password reset flow instead of a shared
-  temporary password.
+- `IAM_ENTRA_USAGE_LOCATION` is required. It is the ISO country code
+  Graph needs before a licence can be assigned.
+- There is no shared temporary password. Each new account gets its
+  own, with `forceChangePasswordNextSignIn` set. The app shows that
+  password once on the request page. It is not written to the audit
+  log, the welcome mail, or the stored result.
+- The app role is written to employee type. Job title is left alone.
+- When the request names a manager, the provider sets that manager.
+- A group name must match exactly one group. Inherited groups are
+  read separately from direct groups. An offboard records inherited
+  groups and does not remove them.
 - Licence mapping: find your tenant's skuPartNumbers in the Entra
   admin center (**Billing → Licenses**) or by calling
   `GET /subscribedSkus` with Graph Explorer. An unmapped licence
@@ -88,16 +95,18 @@ python -m iam_agent.cli --provider entra --dry-run
 # Review what the tenant already holds
 python -m iam_agent.cli --provider entra --review
 
-# Create one real user (asks a human first, audits everything)
-python -m iam_agent.cli --provider entra --hires hires.csv
+# Create one real user. Both people are app users. The approver
+# cannot be the requester.
+python -m iam_agent.cli --provider entra --requester ada.admin --approver bob.approver --hires hires.csv
 ```
 
-`--auto-approve` exists for scripted tests only. Against a real
-tenant, always let a human approve.
+The web app is the usual way to approve. The command line looks the
+approver up and uses that account's role.
 
 ## 6. What to check after the first run
 
-- The user exists in Entra with the right department and job title.
+- The user exists in Entra, created disabled and then enabled, with
+  the right department and employee type. Job title is unchanged.
 - Group memberships match `policies.json`.
 - The licence was assigned (remember: in Entra, a licence is
   assigned separately from account creation, exactly as in the admin

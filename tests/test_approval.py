@@ -1,9 +1,8 @@
 import unittest
-from unittest import mock
 
 from iam_agent import MockProvider, NewHire, OnboardingAgent
-from iam_agent import policies
 from iam_agent.approval import classify, make_approver
+from iam_agent.policies import load_policy
 
 
 def hire(role, username="ada.lovelace"):
@@ -16,44 +15,47 @@ def plan_for(agent, hire_):
 
 class TestClassify(unittest.TestCase):
     def setUp(self):
-        self.agent = OnboardingAgent(MockProvider())
+        self.policy = load_policy()
+        self.agent = OnboardingAgent(MockProvider(), policy=self.policy)
 
-    def test_standard_role_auto_approves(self):
+    def test_standard_role_is_standard(self):
         level, _ = classify(plan_for(self.agent, hire("engineer")),
-                            hire("engineer"))
-        self.assertEqual(level, "auto")
+                            hire("engineer"), self.policy)
+        self.assertEqual(level, "standard")
 
-    def test_manager_role_needs_human(self):
+    def test_manager_role_is_privileged(self):
         level, reason = classify(plan_for(self.agent, hire("manager")),
-                                 hire("manager"))
-        self.assertEqual(level, "human")
+                                 hire("manager"), self.policy)
+        self.assertEqual(level, "privileged")
         self.assertIn("privileged", reason)
 
-    def test_unknown_role_needs_human(self):
+    def test_unknown_role_is_privileged(self):
         level, _ = classify(plan_for(self.agent, hire("chief-wizard")),
-                            hire("chief-wizard"))
-        self.assertEqual(level, "human")
+                            hire("chief-wizard"), self.policy)
+        self.assertEqual(level, "privileged")
 
-    def test_privileged_group_needs_human(self):
-        with mock.patch.dict(policies.ROLE_ACCESS, {
+    def test_privileged_group_is_privileged(self):
+        policy = self.policy.with_roles({
             "ops": {"groups": ["all-staff", "domain-admins"],
                     "licenses": []},
-        }):
-            level, _ = classify(plan_for(self.agent, hire("ops")),
-                                hire("ops"))
-        self.assertEqual(level, "human")
+        })
+        agent = OnboardingAgent(MockProvider(), policy=policy)
+        level, _ = classify(plan_for(agent, hire("ops")), hire("ops"),
+                            policy)
+        self.assertEqual(level, "privileged")
 
 
 class TestRouter(unittest.TestCase):
-    def test_standard_plan_never_calls_human(self):
+    def test_every_plan_asks_the_named_person(self):
         calls = []
-        approver = make_approver(lambda p, h: calls.append(h) or True)
+        approver = make_approver(lambda p, h: calls.append(h) or True,
+                                 human_name="casey")
         agent = OnboardingAgent(MockProvider(), approver=approver)
         result = agent.run(hire("engineer"))
         self.assertEqual(result["status"], "done")
-        self.assertEqual(calls, [])
+        self.assertEqual(len(calls), 1)
         approve_entries = [e for e in agent.audit if e.action == "approve"]
-        self.assertIn("auto", approve_entries[0].note)
+        self.assertIn("casey", approve_entries[0].note)
 
     def test_human_decision_is_audited_by_name(self):
         approver = make_approver(lambda p, h: False, human_name="alice")

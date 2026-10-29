@@ -24,8 +24,9 @@ IAM_DB=/opt/iam-app/iam.db
 IAM_APP_HOST=127.0.0.1
 IAM_APP_PORT=8000
 IAM_COOKIE_SECURE=1
+# Optional. If unset, the first visit is the setup wizard.
 IAM_APP_ADMIN_USER=admin
-IAM_APP_ADMIN_PASSWORD=<a strong password, changed after first login>
+IAM_APP_ADMIN_PASSWORD=<at least 12 characters>
 # Add IAM_SMTP_* for email alerts, IAM_ENTRA_* for the Entra provider.
 ```
 
@@ -43,17 +44,17 @@ a chat message, or on a command line.
 - The app's own security headers (nosniff, DENY framing,
   no-referrer, same-origin CSP) are already set on every response.
 
-## 4. First-login tasks (do these the day it goes live)
+## 4. First-day tasks
 
-1. Log in as the bootstrap admin and **change its password**
-   (Profile page). A bootstrap password that never changes is a
-   standing vulnerability.
-2. On the Users page, create one approver and one requester
-   account. Verify the requester cannot open the Users page and
+1. Complete setup with two people, or sign in as the admin from
+   the environment and create a different approver on the Users
+   page. Confirm a requester cannot open Users or Policy, and
    cannot approve their own request.
-3. Try a wrong password five times on a test account and confirm
-   it locks for 15 minutes (lockout + throttle are on by default).
-4. Submit, approve, and reject one test request of each kind.
+2. Try a wrong password five times on a test account and confirm
+   it locks for 15 minutes.
+3. Submit, approve, and reject one test request of each kind.
+   On the built-in directory, an admin can load the sample company
+   from Access review first.
 
 ## 5. Backups, and prove restores work
 
@@ -72,8 +73,10 @@ a chat message, or on a command line.
 - Set the `IAM_SMTP_*` variables so partial/failed runs email
   someone. Without them, alerts are still recorded and counted on
   the dashboard, but nobody is paged.
-- Poll `/health` from your monitor. It checks the database, the
-  audit chain, and the provider in one call.
+- Poll `/health` from your monitor. It checks that the database
+  answers and, when Entra is configured, that a token can be
+  obtained. It does not list the directory. Check the audit chain
+  with `--verify-audit`.
 
 ## 7. Live Entra verification (**operator step**)
 
@@ -82,7 +85,9 @@ Graph, not a live tenant. Before pointing it at anything real:
 
 1. Follow `ENTRA_SETUP.md` against a **test tenant** first.
 2. Dry-run, then create one test user, and verify in the Entra
-   admin center: account, department, job title, groups, licence.
+   admin center: account enabled, department, employee type,
+   groups, licence, and manager when one was named. Job title is
+   not written by this app.
 3. Off-board that test user and verify: disabled, groups and
    licences stripped.
 4. Run `--verify-audit` and confirm the chain is valid.

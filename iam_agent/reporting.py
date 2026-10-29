@@ -38,6 +38,37 @@ def access_report(provider) -> dict:
     }
 
 
+def group_index(provider, policy) -> list:
+    """Who is in each group. Derived from the policy and the directory.
+
+    A group is listed if the policy names it or anyone holds it.
+    Privileged groups come first. Inherited membership stays separate
+    from direct membership.
+    """
+    names = set(policy.privileged_groups)
+    names.update(policy.fallback["groups"])
+    for access in policy.roles.values():
+        names.update(access["groups"])
+    direct = {}
+    inherited = {}
+    for user in provider.list_users():
+        username = user.get("username") or ""
+        for group in user.get("groups") or []:
+            names.add(group)
+            direct.setdefault(group, []).append(username)
+        for group in user.get("inherited_groups") or []:
+            names.add(group)
+            inherited.setdefault(group, []).append(username)
+    rows = [{
+        "name": name,
+        "privileged": name in policy.privileged_groups,
+        "members": sorted(direct.get(name, [])),
+        "inherited": sorted(inherited.get(name, [])),
+    } for name in names]
+    rows.sort(key=lambda row: (not row["privileged"], row["name"]))
+    return rows
+
+
 def activity_report(audit_entries) -> dict:
     by_action = Counter()
     by_status = Counter()

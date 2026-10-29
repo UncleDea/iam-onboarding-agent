@@ -54,6 +54,12 @@ MIGRATIONS = [
     (5, "app_users locked_until", """
         ALTER TABLE app_users ADD COLUMN locked_until TEXT
     """),
+    (6, "app_meta", """
+        CREATE TABLE IF NOT EXISTS app_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        )
+    """),
 ]
 
 

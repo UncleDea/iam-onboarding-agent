@@ -1,5 +1,28 @@
 # Changelog
 
+## 1.0.0 — 2026-10-28
+
+One install for one company. The first visit is a setup wizard
+(company name, admin, and a different approver). An admin edits
+policy in the app. The built-in directory can load a sample
+company. Microsoft sign-in is optional and only matches an existing
+app user.
+
+Access rules live only in the policy file. A standard grant or an
+offboard needs an approver or admin who is not the requester. A
+privileged grant needs an admin who is not the requester. The
+approved plan is the plan that runs. Nothing approves itself.
+
+Onboarding creates the account disabled and enables it after groups
+and licences. A move restores the previous access when a later step
+fails. Entra uses a per-account temporary password, a required usage
+location, employee type for the app role, and a manager when the
+request names one. Health checks the database and, for Entra, a
+token. App passwords are at least 12 characters.
+
+Removed the three demo scripts, the printed bootstrap password, and
+the shared Entra temporary password.
+
 ## 0.7.0 — 2026-10-28 (welcome email for real)
 
 - Added: real welcome emails (`iam_agent/emailing.py`). The

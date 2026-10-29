@@ -24,10 +24,48 @@ from datetime import datetime, timezone
 
 from .emailing import welcome_body, welcome_subject
 from .models import AuditEntry, NewHire, PlanStep
-from .policies import access_for, find_conflicts
+from .policies import load_policy
+from .providers import AlreadyExists
 from .retry import TransientError, call_with_retry
 
 logger = logging.getLogger(__name__)
+
+
+def plan_fingerprint(plan) -> dict:
+    """The access change a plan represents, ignoring wording and order."""
+    def values(action, key):
+        return sorted(
+            step.details.get(key) for step in plan
+            if step.action == action and step.details.get(key))
+
+    role = ""
+    department = ""
+    for step in plan:
+        if step.action in ("create_user", "update_user"):
+            if step.details.get("role"):
+                role = step.details["role"]
+            if step.details.get("department"):
+                department = step.details["department"]
+    return {
+        "add_groups": values("add_to_group", "group"),
+        "remove_groups": values("remove_from_group", "group"),
+        "add_licenses": values("assign_license", "license"),
+        "remove_licenses": values("revoke_license", "license"),
+        "create": any(step.action == "create_user" for step in plan),
+        "disable": any(step.action == "disable_user" for step in plan),
+        "role": role,
+        "department": department,
+    }
+
+
+def pack_plan(plan) -> list:
+    return [{"action": step.action, "description": step.description,
+             "details": dict(step.details)} for step in plan]
+
+
+def unpack_plan(raw) -> list:
+    return [PlanStep(item["action"], item["description"],
+                     dict(item.get("details") or {})) for item in raw]
 
 
 def _now() -> str:
@@ -39,13 +77,14 @@ _COMPENSATION = {
     "create_user": "disable_user",
     "add_to_group": "remove_from_group",
     "assign_license": "revoke_license",
+    "enable_user": "disable_user",
 }
 
 
 class OnboardingAgent:
     def __init__(self, provider, approver=None, audit_file=None,
                  audit_store=None, notifier=None, retry_attempts: int = 3,
-                 email_sender=None):
+                 email_sender=None, policy=None):
         """provider: an IdentityProvider. approver: optional callable
         taking (plan, hire) and returning a boolean or a
         (approved, decided_by) tuple -- see iam_agent.approval.
@@ -62,7 +101,9 @@ class OnboardingAgent:
         self.notifier = notifier
         self.retry_attempts = retry_attempts
         self.email_sender = email_sender
+        self.policy = policy if policy is not None else load_policy()
         self.audit = []
+        self._temporary_password = None
 
     # -- on-boarding ----------------------------------------------------
 
@@ -74,8 +115,8 @@ class OnboardingAgent:
         a plan that would grant a toxic combination must never reach
         an approver's desk looking normal.
         """
-        access = access_for(hire.role)
-        conflicts = find_conflicts(access["groups"])
+        access = self.policy.access_for(hire.role)
+        conflicts = self.policy.find_conflicts(access["groups"])
         if conflicts:
             raise ValueError(
                 f"segregation-of-duties conflict for role {hire.role!r}: "
@@ -101,6 +142,11 @@ class OnboardingAgent:
                 {"license": licence},
             ))
         plan.append(PlanStep(
+            "enable_user",
+            f"Enable account {hire.username}",
+            {},
+        ))
+        plan.append(PlanStep(
             "send_welcome",
             f"Prepare welcome message for {hire.display_name}",
             {"manager": hire.manager, "start_date": hire.start_date},
@@ -108,9 +154,12 @@ class OnboardingAgent:
         return plan
 
     def run(self, hire: NewHire, dry_run: bool = False,
-            requester: str = None) -> dict:
-        """Run one on-boarding end to end. Returns a result summary."""
-        plan = self.build_plan(hire)
+            requester: str = None, plan=None) -> dict:
+        """Run one on-boarding end to end. Returns a result summary.
+
+        `plan`, when given, is the frozen plan the approver saw.
+        """
+        plan = list(plan) if plan is not None else self.build_plan(hire)
         if dry_run:
             return {"hire": hire.username, "planned": plan, "executed": [],
                     "status": "dry-run"}
@@ -144,19 +193,23 @@ class OnboardingAgent:
                 self._log(step.action, hire.username, "done",
                           step.description)
                 executed.append(step)
-            except ValueError as exc:
-                # Idempotent resume: if the account already exists, the
-                # run is being repeated (or partially retried). Skip
-                # creation and continue with groups and licences instead
-                # of failing the whole on-boarding.
-                if step.action == "create_user" and "already exists" in str(exc):
-                    self._log(step.action, hire.username, "skipped",
-                              f"{hire.username} already exists; continuing")
-                    executed.append(step)
-                    continue
-                self._log(step.action, hire.username, "failed", str(exc))
-                status = "partial"
-                break
+            except AlreadyExists:
+                if step.action != "create_user":
+                    self._log(step.action, hire.username, "failed",
+                              f"{hire.username} already exists")
+                    status = "partial"
+                    break
+                existing = self.provider.get_user(hire.username) or {}
+                if existing.get("active"):
+                    self._log(step.action, hire.username, "failed",
+                              f"{hire.username} is already active; use move")
+                    status = "failed"
+                    break
+                self._log(step.action, hire.username, "skipped",
+                          f"{hire.username} already exists and is "
+                          "disabled; continuing")
+                executed.append(step)
+                continue
             except Exception as exc:  # noqa: BLE001 -- reported, not hidden
                 self._log(step.action, hire.username, "failed", str(exc))
                 status = "partial"
@@ -166,6 +219,9 @@ class OnboardingAgent:
         logger.info("onboarding %s: %s", hire.username, status)
         result = {"hire": hire.username, "planned": plan,
                   "executed": executed, "status": status}
+        if status == "done" and self._temporary_password:
+            result["temporary_password"] = self._temporary_password
+        self._temporary_password = None
         self._notify(hire.username, status,
                      f"{len(executed)}/{len(plan)} steps executed")
         return result
@@ -180,7 +236,13 @@ class OnboardingAgent:
         current = self.provider.get_user(username)
         if current is None:
             raise ValueError(f"unknown user {username!r}")
-        target = access_for(new_role)
+        target = self.policy.access_for(new_role)
+        conflicts = self.policy.find_conflicts(target["groups"])
+        if conflicts:
+            raise ValueError(
+                f"segregation-of-duties conflict for role {new_role!r}: "
+                f"{conflicts[0]} must never be held together"
+            )
         plan = []
         for group in sorted(set(current["groups"]) - set(target["groups"])):
             plan.append(PlanStep("remove_from_group",
@@ -202,12 +264,19 @@ class OnboardingAgent:
                              f"Move {username} to role {new_role!r}",
                              {"role": new_role,
                               **({"department": new_department}
-                                  if new_department else {})}))
+                                  if new_department else {}),
+                              "_previous": {
+                                  "groups": list(current["groups"]),
+                                  "licenses": list(current["licenses"]),
+                                  "role": current.get("role", ""),
+                                  "department": current.get("department", ""),
+                              }}))
         return plan
 
     def move(self, username: str, new_role: str, new_department: str = None,
-             dry_run: bool = False, requester: str = None) -> dict:
-        plan = self.build_move_plan(username, new_role, new_department)
+             dry_run: bool = False, requester: str = None, plan=None) -> dict:
+        plan = (list(plan) if plan is not None else
+                self.build_move_plan(username, new_role, new_department))
         if dry_run:
             return {"hire": username, "planned": plan, "executed": [],
                     "status": "dry-run"}
@@ -229,7 +298,12 @@ class OnboardingAgent:
             except Exception as exc:  # noqa: BLE001
                 self._log(step.action, username, "failed", str(exc))
                 break
-        status = "done" if len(executed) == len(plan) else "partial"
+        if len(executed) == len(plan):
+            status = "done"
+        elif self._restore_move(plan, username):
+            status = "failed"
+        else:
+            status = "partial"
         return {"hire": username, "planned": plan, "executed": executed,
                 "status": status}
 
@@ -251,11 +325,18 @@ class OnboardingAgent:
             plan.append(PlanStep("revoke_license",
                                  f"Revoke licence {licence!r} from {username}",
                                  {"license": licence}))
+        for group in current.get("inherited_groups") or []:
+            plan.append(PlanStep(
+                "record_inherited",
+                f"Inherited group {group!r} stays; it is not a direct "
+                f"membership of {username}",
+                {"group": group}))
         return plan
 
     def offboard(self, username: str, dry_run: bool = False,
-                 requester: str = None) -> dict:
-        plan = self.build_offboard_plan(username)
+                 requester: str = None, plan=None) -> dict:
+        plan = (list(plan) if plan is not None else
+                self.build_offboard_plan(username))
         if dry_run:
             return {"hire": username, "planned": plan, "executed": [],
                     "status": "dry-run"}
@@ -286,7 +367,9 @@ class OnboardingAgent:
     def _approve(self, plan, hire, requester):
         """Return (approved, decided_by), enforcing requester != approver."""
         if self.approver is None:
-            return True, "auto (no approver configured)"
+            self._log("approve", hire.username, "rejected",
+                      "no approver configured")
+            return False, "none"
         decision = self.approver(plan, hire)
         if isinstance(decision, tuple):
             approved, decided_by = decision
@@ -333,6 +416,9 @@ class OnboardingAgent:
         username = hire.username
         if step.action == "create_user":
             self.provider.create_user(hire)
+            take = getattr(self.provider, "take_temporary_password", None)
+            if take is not None:
+                self._temporary_password = take(hire.username)
         elif step.action == "add_to_group":
             self.provider.add_to_group(username, step.details["group"])
         elif step.action == "remove_from_group":
@@ -347,9 +433,10 @@ class OnboardingAgent:
                 if k in ("role", "department")})
         elif step.action == "disable_user":
             self.provider.disable_user(username)
-        elif step.action == "send_welcome":
-            pass  # No real email yet: this step is where an email
-            # provider plugs in later. The audit entry still records it.
+        elif step.action == "enable_user":
+            self.provider.enable_user(username)
+        elif step.action == "record_inherited":
+            return
         else:
             raise ValueError(f"unknown action {step.action!r}")
 
@@ -366,6 +453,42 @@ class OnboardingAgent:
             except Exception as exc:  # noqa: BLE001
                 self._log(f"rollback_{step.action}", hire.username,
                           "failed", str(exc))
+
+    def _restore_move(self, plan, username: str) -> bool:
+        """Put back the access stored on the move plan. True if it held."""
+        previous = None
+        for step in plan:
+            if step.action == "update_user" and step.details.get("_previous"):
+                previous = step.details["_previous"]
+        if previous is None:
+            self._log("rollback_move", username, "failed",
+                      "move plan has no previous access to restore")
+            return False
+        try:
+            current = self.provider.get_user(username)
+            if current is None:
+                raise ValueError(f"unknown user {username!r}")
+            for group in list(current["groups"]):
+                if group not in previous["groups"]:
+                    self.provider.remove_from_group(username, group)
+            for group in previous["groups"]:
+                if group not in current["groups"]:
+                    self.provider.add_to_group(username, group)
+            for licence in list(current["licenses"]):
+                if licence not in previous["licenses"]:
+                    self.provider.revoke_license(username, licence)
+            for licence in previous["licenses"]:
+                if licence not in current["licenses"]:
+                    self.provider.assign_license(username, licence)
+            self.provider.update_user(
+                username, role=previous.get("role", ""),
+                department=previous.get("department", ""))
+        except Exception as exc:  # noqa: BLE001
+            self._log("rollback_move", username, "failed", str(exc))
+            return False
+        self._log("rollback_move", username, "done",
+                  "previous access restored")
+        return True
 
     def _notify(self, username: str, status: str, summary: str) -> None:
         if self.notifier is not None:

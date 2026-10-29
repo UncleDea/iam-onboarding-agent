@@ -1,0 +1,10 @@
+<p>Create the first two people. One submits requests. The other approves them. The same person cannot do both for a request.</p>
+<p class="error">{{error}}</p>
+<form method="post" action="/setup">
+<label>Company name <input name="company" required></label>
+<label>Admin username <input name="admin_user" required></label>
+<label>Admin password <input name="admin_password" type="password" required></label>
+<label>Approver username <input name="approver_user" required></label>
+<label>Approver password <input name="approver_password" type="password" required></label>
+<button type="submit">Create accounts</button>
+</form>

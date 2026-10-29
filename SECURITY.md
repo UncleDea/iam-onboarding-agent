@@ -29,18 +29,21 @@ It must **not** be a Global Administrator. If the agent is compromised,
 the damage is bounded by what its identity can do. Review these
 permissions whenever a new capability is added.
 
-## 3. Approvals: a human, a named human, a separate human
+## 3. Approvals: a named person, and a different person
 
-- Routine plans auto-approve; privileged, unknown, or unusual plans
-  require a human (see `iam_agent/approval.py`).
-- Every approval decision is audited with who decided it. An approval
-  that cannot be attributed to a person is not an approval.
-- Segregation of duties, the next step beyond this codebase: the person
-  who requests an on-boarding must not be the person who approves it.
-  Today the engine records the approver's name; a production system
-  must also *enforce* requester != approver. Do not deploy without it.
-- Segregation-of-duties conflicts (e.g. `payment-create` together with
+- Nothing approves itself. A standard grant or an offboard needs an
+  approver or an admin who is not the requester. A privileged grant
+  needs an admin who is not the requester. Privileged means a role,
+  group, or licence listed in the policy, or a role the policy does
+  not name.
+- The decision is stored with the person who made it. The plan they
+  saw is the plan that runs.
+- Conflicting groups (for example `payment-create` together with
   `payment-approve`) are refused before anything is created.
+- App passwords use PBKDF2-HMAC-SHA256 with 600,000 iterations and
+  must be at least 12 characters. A missing username still runs a
+  password check, so the timing does not reveal whether the account
+  exists. An inactive account cannot keep a session.
 
 ## 4. The audit log is evidence: protect it
 
@@ -67,14 +70,17 @@ permissions whenever a new capability is added.
   trust but did not write. When a real provider is added, each new
   dependency (for example MSAL) should be pinned and reviewed.
 
-## 7. Before any production use, these must exist
+## 7. Before any production use
 
-1. A real provider running against a **test tenant** first.
-2. Requester != approver enforcement.
-3. A durable audit store (database, not a local file) with restricted
-   access and backups.
-4. Retry/backoff and alerting on partial failures, so a half-finished
-   on-boarding is noticed within minutes, not discovered weeks later.
-5. An access-recertification process: periodically re-confirm that
-   people still need the access they hold. On-boarding without
-   off-boarding and review is how access quietly accumulates forever.
+1. Two different people hold the admin and approver accounts.
+2. The database file is restricted and backed up, and a restore has
+   been tried. `--verify-audit` checks the hash chain. `/health` does
+   not replay it.
+3. If the directory is Entra, follow ENTRA_SETUP.md on a test tenant
+   first. This build is not proof against a live tenant. Changes made
+   in the Entra portal are outside this audit.
+4. A temporary Entra password is generated per account, shown once,
+   and is not written to the audit log, the welcome mail, or the
+   stored result.
+5. Review access on a schedule. This version records access and can
+   offboard. It does not run a recertification campaign.

@@ -9,9 +9,11 @@ gives the system four senses, all small and dependency-free:
 - LOGGING: one setup function. Plain text for a terminal, JSON
   lines for a log aggregator, each line carrying a request_id when
   one is active (set per web request via contextvars).
-- HEALTH: a single check that answers "is the system OK?" -- the
-  database answers, the audit chain verifies, the provider lists
-  users. One failed check means unhealthy, with the reason attached.
+- HEALTH: a cheap check that the database answers and, when Entra
+  is configured, that a token can be obtained. It does not list the
+  directory or replay the audit chain. One failed check means
+  unhealthy. The names of failed checks are returned; the detail
+  stays in the log.
 - ALERTS: when a run ends partial or failed, an alert is recorded
   and the notifier is called -- but at most once per target per
   15 minutes, so a broken provider does not spam anyone.
@@ -90,29 +92,31 @@ def setup_logging(json_format: bool = False, level: int = logging.INFO):
 
 
 def check_health(db, audit_store, provider) -> dict:
-    """Run every health check. Returns {status, checks} where
-    status is 'healthy' only if every check passed."""
+    """Cheap liveness. Does not list the directory or replay the audit chain.
+
+    Returns status and the names of failed checks. Details stay in the log.
+    """
+    del audit_store
     checks = {}
     try:
         db.query_one("SELECT 1 AS ok")
         checks["database"] = "ok"
-    except Exception as exc:  # noqa: BLE001 -- health reports, not raises
-        checks["database"] = f"error: {exc}"
-    try:
-        checks["audit_chain"] = ("ok" if audit_store is None
-                                 or audit_store.verify()
-                                 else "INVALID: chain verification failed")
-    except Exception as exc:  # noqa: BLE001
-        checks["audit_chain"] = f"error: {exc}"
-    try:
-        users = provider.list_users() if provider is not None else []
-        checks["provider"] = f"ok ({len(users)} users)"
-    except Exception as exc:  # noqa: BLE001
-        checks["provider"] = f"error: {exc}"
-    status = ("healthy" if all(v == "ok" or v.startswith("ok (")
-                              for v in checks.values())
-              else "unhealthy")
-    return {"status": status, "checks": checks}
+    except Exception:  # noqa: BLE001 -- health reports, not raises
+        checks["database"] = "failed"
+    graph = getattr(provider, "graph", None)
+    if graph is not None and hasattr(graph, "token"):
+        try:
+            graph.token()
+            checks["provider"] = "ok"
+        except Exception:  # noqa: BLE001
+            checks["provider"] = "failed"
+    else:
+        checks["provider"] = "ok"
+    failed = [name for name, value in checks.items() if value != "ok"]
+    return {
+        "status": "unhealthy" if failed else "healthy",
+        "failed": failed,
+    }
 
 
 class AlertManager:

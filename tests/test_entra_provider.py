@@ -8,6 +8,7 @@ endpoints, payloads, and error mapping the real provider would use.
 import unittest
 
 from iam_agent.entra_provider import EntraProvider, GraphClient
+from iam_agent.providers import AlreadyExists
 from iam_agent.models import NewHire
 from iam_agent.retry import TransientError
 
@@ -67,6 +68,11 @@ class TestEntraProvider(unittest.TestCase):
         self.assertEqual(payload["userPrincipalName"],
                          "ada.lovelace@example.onmicrosoft.com")
         self.assertEqual(payload["mailNickname"], "ada.lovelace")
+        self.assertEqual(payload["usageLocation"], "US")
+        self.assertEqual(payload["employeeType"], "engineer")
+        self.assertNotIn("jobTitle", payload)
+        self.assertNotEqual(payload["passwordProfile"]["password"],
+                            "TempPass123!")
         self.assertTrue(payload["passwordProfile"]
                         ["forceChangePasswordNextSignIn"])
 
@@ -75,7 +81,7 @@ class TestEntraProvider(unittest.TestCase):
             409, {"error": {"code": "Request_ResourceAlreadyExists",
                             "message": "exists"}})}
         provider, _ = make_provider(routes)
-        with self.assertRaises(ValueError) as ctx:
+        with self.assertRaises(AlreadyExists) as ctx:
             provider.create_user(hire())
         self.assertIn("already exists", str(ctx.exception))
 
@@ -166,6 +172,7 @@ class TestEntraProvider(unittest.TestCase):
             ("GET", "/groups"): (200, {"value": [{"id": "g1"}]}),
             ("POST", "/groups/g1/members/$ref"): (204, {}),
             ("POST", "/users/u1/assignLicense"): (200, {}),
+            ("PATCH", "/users/u1"): (200, {}),
             ("GET", "/subscribedSkus"): (
                 200, {"value": [{"skuId": "sku-e3",
                                  "skuPartNumber": "ENTERPRISEPACK"}]}),
@@ -175,6 +182,39 @@ class TestEntraProvider(unittest.TestCase):
         agent = OnboardingAgent(provider, approver=lambda p, h: True)
         result = agent.run(hire())
         self.assertEqual(result["status"], "done")
+
+    def test_ambiguous_group_name_is_refused(self):
+        routes = {
+            ("GET", "/users/ada.lovelace@example.onmicrosoft.com"): (
+                200, {"id": "u1"}),
+            ("GET", "/groups"): (200, {"value": [{"id": "g1"}, {"id": "g2"}]}),
+        }
+        provider, _ = make_provider(routes)
+        with self.assertRaises(ValueError) as ctx:
+            provider.add_to_group("ada.lovelace", "engineering")
+        self.assertIn("matched 2", str(ctx.exception))
+
+    def test_inherited_group_is_separate_from_direct(self):
+        routes = {
+            ("GET", "/users/ada.lovelace@example.onmicrosoft.com"): (
+                200, {"id": "u1", "displayName": "Ada Lovelace",
+                      "department": "Engineering", "employeeType": "engineer",
+                      "accountEnabled": True, "assignedLicenses": []}),
+            ("GET", "/users/u1/memberOf"): (
+                200, {"value": [
+                    {"@odata.type": "#microsoft.graph.group",
+                     "displayName": "engineering"}]}),
+            ("GET", "/users/u1/transitiveMemberOf"): (
+                200, {"value": [
+                    {"@odata.type": "#microsoft.graph.group",
+                     "displayName": "engineering"},
+                    {"@odata.type": "#microsoft.graph.group",
+                     "displayName": "all-staff"}]}),
+        }
+        provider, _ = make_provider(routes)
+        user = provider.get_user("ada.lovelace")
+        self.assertEqual(user["groups"], ["engineering"])
+        self.assertEqual(user["inherited_groups"], ["all-staff"])
 
 
 if __name__ == "__main__":

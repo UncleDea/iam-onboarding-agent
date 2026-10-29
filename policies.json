@@ -1,1 +1,38 @@
-{"engineer":{"groups":["all-staff","engineering"],"licenses":["office-standard"]},"manager":{"groups":["all-staff","managers"],"licenses":["office-standard"]},"sales":{"groups":["all-staff","sales"],"licenses":["office-standard","crm"]}}
+{
+  "roles": {
+    "engineer": {
+      "groups": ["all-staff", "engineering"],
+      "licenses": ["office-standard"]
+    },
+    "manager": {
+      "groups": ["all-staff", "managers"],
+      "licenses": ["office-standard"]
+    },
+    "sales": {
+      "groups": ["all-staff", "sales"],
+      "licenses": ["office-standard", "crm"]
+    },
+    "analyst": {
+      "groups": ["all-staff", "analysts"],
+      "licenses": ["office-standard"]
+    },
+    "agent": {
+      "groups": ["all-staff", "agents"],
+      "licenses": ["office-standard"]
+    },
+    "caregiver": {
+      "groups": ["all-staff", "caregivers"],
+      "licenses": ["office-standard"]
+    }
+  },
+  "fallback": {
+    "groups": ["all-staff"],
+    "licenses": []
+  },
+  "conflicts": [
+    ["payment-create", "payment-approve"]
+  ],
+  "privileged_roles": ["manager", "admin", "administrator"],
+  "privileged_groups": ["managers", "admins", "domain-admins", "finance-admins"],
+  "privileged_licenses": ["admin-tools"]
+}

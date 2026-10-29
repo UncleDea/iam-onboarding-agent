@@ -15,14 +15,19 @@ Environment variables (all optional unless noted):
     IAM_LOG_JSON            1 for JSON log lines, 0 for plain text
     IAM_APP_HOST            web app bind host (default: 127.0.0.1)
     IAM_APP_PORT            web app port (default: 8000)
-    IAM_APP_ADMIN_USER      bootstrap admin username
-    IAM_APP_ADMIN_PASSWORD  bootstrap admin password
+    IAM_APP_ADMIN_USER      optional admin username, created only
+                            when no app user exists yet
+    IAM_APP_ADMIN_PASSWORD  password for that admin (at least 12
+                            characters). If both are unset, the first
+                            visit is the setup wizard.
     IAM_COOKIE_SECURE       1 to add the Secure flag to the session
                             cookie (set this behind TLS)
     IAM_LOCKOUT_THRESHOLD   failed logins before lockout (default: 5)
     IAM_LOCKOUT_MINUTES     lockout duration in minutes (default: 15)
     IAM_ENTRA_*             see ENTRA_SETUP.md (required when
-                            IAM_PROVIDER=entra)
+                            IAM_PROVIDER=entra). IAM_ENTRA_USAGE_LOCATION
+                            is required; there is no shared temporary
+                            password.
     IAM_SMTP_*              see notifiers.py (optional)
 """
 
@@ -66,7 +71,7 @@ class Settings:
             entra={name: os.environ.get(name) for name in (
                 "IAM_ENTRA_TENANT_ID", "IAM_ENTRA_CLIENT_ID",
                 "IAM_ENTRA_CLIENT_SECRET", "IAM_ENTRA_DOMAIN",
-                "IAM_ENTRA_TEMP_PASSWORD", "IAM_ENTRA_LICENSE_MAP")},
+                "IAM_ENTRA_USAGE_LOCATION", "IAM_ENTRA_LICENSE_MAP")},
         )
 
     def validate(self) -> None:
@@ -78,7 +83,7 @@ class Settings:
             missing = [name for name in (
                 "IAM_ENTRA_TENANT_ID", "IAM_ENTRA_CLIENT_ID",
                 "IAM_ENTRA_CLIENT_SECRET", "IAM_ENTRA_DOMAIN",
-                "IAM_ENTRA_TEMP_PASSWORD") if not self.entra.get(name)]
+                "IAM_ENTRA_USAGE_LOCATION") if not self.entra.get(name)]
             problems.extend(f"missing {name}" for name in missing)
         if problems:
             raise ValueError("invalid configuration: " + "; ".join(problems))

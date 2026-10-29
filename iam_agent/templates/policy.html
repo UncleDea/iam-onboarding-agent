@@ -1,0 +1,9 @@
+<p>This file is the only access policy. A change here applies to the next request. A request already waiting keeps the plan that was submitted.</p>
+<p class="error">{{error}}</p>
+<form method="post" action="/policy">
+<input type="hidden" name="csrf_token" value="{{csrf}}">
+<label>Policy JSON
+<textarea class="document" name="document" rows="24">{{document}}</textarea>
+</label>
+<button type="submit">Save policy</button>
+</form>

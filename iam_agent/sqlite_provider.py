@@ -9,9 +9,10 @@ the mock and Entra providers.
 """
 
 from .db import Database
+from .providers import AlreadyExists, IdentityProvider, NotFound
 
 
-class SqliteProvider:
+class SqliteProvider(IdentityProvider):
     """SQLite-backed provider. One file holds the whole directory."""
 
     def __init__(self, path: str = None, db: Database = None):
@@ -45,11 +46,11 @@ class SqliteProvider:
     def create_user(self, hire) -> dict:
         existing = self.get_user(hire.username)
         if existing is not None:
-            raise ValueError(f"user {hire.username!r} already exists")
+            raise AlreadyExists(f"user {hire.username!r} already exists")
         self._db.execute(
             "INSERT INTO users (username, display_name, department,"
             "  role, manager, start_date, active) VALUES (?, ?, ?, ?,"
-            "  ?, ?, 1)",
+            "  ?, ?, 0)",
             (hire.username, hire.display_name, hire.department,
              hire.role, hire.manager, hire.start_date),
         )
@@ -119,6 +120,12 @@ class SqliteProvider:
             "UPDATE users SET active = 0 WHERE username = ?", (username,),
         )
 
+    def enable_user(self, username: str) -> None:
+        self._require(username)
+        self._db.execute(
+            "UPDATE users SET active = 1 WHERE username = ?", (username,),
+        )
+
     def list_users(self) -> list:
         rows = self._db.query("SELECT username FROM users ORDER BY username")
         return [self.get_user(row["username"]) for row in rows]
@@ -129,4 +136,4 @@ class SqliteProvider:
 
     def _require(self, username: str) -> None:
         if self.get_user(username) is None:
-            raise ValueError(f"unknown user {username!r}")
+            raise NotFound(f"unknown user {username!r}")

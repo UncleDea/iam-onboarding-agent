@@ -31,12 +31,15 @@ class TestObservability(unittest.TestCase):
 
     def test_health_reports_provider_failure(self):
         class BrokenProvider:
-            def list_users(self):
-                raise RuntimeError("down")
+            class graph:
+                @staticmethod
+                def token():
+                    raise RuntimeError("down")
         db = Database(":memory:")
         health = check_health(db, None, BrokenProvider())
         self.assertEqual(health["status"], "unhealthy")
-        self.assertIn("down", health["checks"]["provider"])
+        self.assertEqual(health["failed"], ["provider"])
+        self.assertNotIn("down", str(health))
         db.close()
 
 
@@ -136,6 +139,54 @@ class TestService(unittest.TestCase):
         finished = service.approve(request["id"], "boss", "approver")
         self.assertEqual(finished["status"], "partial")
         self.assertEqual(len(service.alerts.alerts), 1)
+
+    def test_privileged_grant_needs_an_admin(self):
+        request = self.service.submit_onboard({
+            "first_name": "Ada", "last_name": "Lovelace",
+            "username": "ada.lovelace", "department": "Engineering",
+            "role": "manager", "manager": "", "start_date": "2026-11-02",
+        }, "alice")
+        with self.assertRaises(ValueError):
+            self.service.approve(request["id"], "boss", "approver")
+        self.assertEqual(
+            self.service.get_request(request["id"])["status"],
+            "pending_approval")
+        finished = self.service.approve(request["id"], "ada.admin", "admin")
+        self.assertEqual(finished["status"], "done")
+
+    def test_drift_leaves_the_request_pending(self):
+        request = self.service.submit_onboard({
+            "first_name": "Ada", "last_name": "Lovelace",
+            "username": "ada.lovelace", "department": "Engineering",
+            "role": "engineer", "manager": "", "start_date": "2026-11-02",
+        }, "alice")
+        self.service.policy = self.service.policy.with_roles({
+            "engineer": {"groups": ["all-staff"], "licenses": []},
+        })
+        with self.assertRaises(ValueError):
+            self.service.approve(request["id"], "boss", "approver")
+        self.assertEqual(
+            self.service.get_request(request["id"])["status"],
+            "pending_approval")
+        self.assertIsNone(self.service.provider.get_user("ada.lovelace"))
+
+    def test_a_second_decision_is_refused(self):
+        request = self.service.submit_onboard({
+            "first_name": "Ada", "last_name": "Lovelace",
+            "username": "ada.lovelace", "department": "Engineering",
+            "role": "engineer", "manager": "", "start_date": "2026-11-02",
+        }, "alice")
+        self.service.approve(request["id"], "boss", "approver")
+        with self.assertRaises(ValueError):
+            self.service.approve(request["id"], "ada.admin", "admin")
+
+    def test_running_request_is_partial_after_restart(self):
+        request = self.service.requests.create(
+            "onboard", {"username": "ada.lovelace"}, "alice")
+        self.service.requests.decide(request["id"], "boss", True)
+        recovered = self.service.recover_interrupted()
+        self.assertEqual(recovered[0]["status"], "partial")
+        self.assertEqual(len(self.service.alerts.alerts), 1)
 
 
 if __name__ == "__main__":

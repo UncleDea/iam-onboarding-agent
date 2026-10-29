@@ -73,7 +73,7 @@ class TestRequests(TempDb):
                                "alice")
         self.assertEqual(request["status"], "pending_approval")
         decided = store.decide(request["id"], "boss", True)
-        self.assertEqual(decided["status"], "approved")
+        self.assertEqual(decided["status"], "running")
         self.assertEqual(decided["approver"], "boss")
         finished = store.finish(request["id"], "done", {"engine_status": "done"})
         self.assertEqual(finished["status"], "done")
@@ -97,8 +97,8 @@ class TestAuth(TempDb):
 
     def test_login_session_and_logout(self):
         auth = AuthStore(self.db)
-        auth.create_user("alice", "pw123456", "requester")
-        token = auth.authenticate("alice", "pw123456")
+        auth.create_user("alice", "pw123456789012", "requester")
+        token = auth.authenticate("alice", "pw123456789012")
         self.assertIsNotNone(token)
         self.assertIsNone(auth.authenticate("alice", "wrong"))
         session = auth.get_session(token)

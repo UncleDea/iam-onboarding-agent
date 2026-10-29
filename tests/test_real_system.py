@@ -73,6 +73,24 @@ class TestRealSystemBehaviours(unittest.TestCase):
         self.assertIn("crm", user["licenses"])
         self.assertEqual(user["role"], "sales")
 
+    def test_failed_move_restores_previous_access(self):
+        class FailSales(MockProvider):
+            def add_to_group(self, username, group):
+                if group == "sales":
+                    raise ValueError("group service down")
+                return super().add_to_group(username, group)
+
+        agent = OnboardingAgent(FailSales(),
+                                approver=lambda p, h: (True, "boss"))
+        agent.run(hire())
+        result = agent.move("ada.lovelace", "sales")
+        self.assertEqual(result["status"], "failed")
+        user = agent.provider.users["ada.lovelace"]
+        self.assertIn("engineering", user["groups"])
+        self.assertNotIn("sales", user["groups"])
+        self.assertEqual(user["role"], "engineer")
+        self.assertNotIn("crm", user["licenses"])
+
     def test_offboard_disables_and_strips_everything(self):
         agent = OnboardingAgent(MockProvider(),
                                 approver=lambda p, h: (True, "boss"))

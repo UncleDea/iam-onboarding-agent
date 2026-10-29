@@ -1,6 +1,7 @@
 import unittest
 
 from iam_agent import MockProvider, NewHire
+from iam_agent.providers import AlreadyExists, NotFound
 
 
 class TestMockProvider(unittest.TestCase):
@@ -11,12 +12,15 @@ class TestMockProvider(unittest.TestCase):
 
     def test_create_then_disable(self):
         self.provider.create_user(self.hire)
+        self.assertFalse(self.provider.users["ada.lovelace"]["active"])
+        self.provider.enable_user("ada.lovelace")
+        self.assertTrue(self.provider.users["ada.lovelace"]["active"])
         self.provider.disable_user("ada.lovelace")
         self.assertFalse(self.provider.users["ada.lovelace"]["active"])
 
     def test_duplicate_create_raises(self):
         self.provider.create_user(self.hire)
-        with self.assertRaises(ValueError):
+        with self.assertRaises(AlreadyExists):
             self.provider.create_user(self.hire)
 
     def test_group_and_license_do_not_duplicate(self):
@@ -27,7 +31,7 @@ class TestMockProvider(unittest.TestCase):
             self.provider.users["ada.lovelace"]["groups"], ["engineering"])
 
     def test_unknown_user_raises(self):
-        with self.assertRaises(ValueError):
+        with self.assertRaises(NotFound):
             self.provider.add_to_group("ghost", "engineering")
 
 

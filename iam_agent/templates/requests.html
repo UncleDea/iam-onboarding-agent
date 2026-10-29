@@ -1,4 +1,9 @@
-<p>Filter: <a href="/requests">all</a> | <a href="/requests?status=pending_approval">pending</a> | <a href="/requests?status=done">done</a> | <a href="/requests?status=rejected">rejected</a></p>
+<p class="filters">
+<a href="/requests"{{filter_all}}>All</a>
+<a href="/requests?status=pending_approval"{{filter_pending}}>Pending</a>
+<a href="/requests?status=done"{{filter_done}}>Done</a>
+<a href="/requests?status=rejected"{{filter_rejected}}>Rejected</a>
+</p>
 <table>
 <tr><th>ID</th><th>Kind</th><th>User</th><th>Status</th><th>Requester</th><th>Approver</th></tr>
 {{rows}}

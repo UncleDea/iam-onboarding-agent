@@ -1,51 +1,161 @@
-"""Access policies: which role gets which groups and licences.
+"""Access policy loaded from one JSON file.
 
-This is the "brain" of what access means in your organisation. Change this
-file and the agent's behaviour changes everywhere, without touching the
-engine or any provider. A real deployment would load this from a file or
-a database; a plain dictionary keeps the from-scratch version readable.
+Operators change roles, the unknown-role fallback, segregation pairs,
+and which access counts as privileged by editing that file (or, later,
+the Policy page, which writes the same file). Nothing in this module
+chooses access on its own, and nothing here runs at import time.
 """
 
 import json
 import os
 from pathlib import Path
 
-_DEFAULT_ROLE_ACCESS = {
-    "engineer": {
-        "groups": ["all-staff", "engineering"],
-        "licenses": ["office-standard"],
-    },
-    "sales": {
-        "groups": ["all-staff", "sales"],
-        "licenses": ["office-standard", "crm"],
-    },
-    "manager": {
-        "groups": ["all-staff", "managers"],
-        "licenses": ["office-standard"],
-    },
-}
 
-FALLBACK = {"groups": ["all-staff"], "licenses": []}
-
-# Segregation of duties: groups that must never be held together, because
-# one person could then both perform and approve the same sensitive act.
-# The engine refuses to build a plan that violates this, before anything
-# is created. Add your own pairs here as the organisation grows.
-CONFLICTING_GROUPS = [
-    frozenset({"payment-create", "payment-approve"}),
-]
+_REQUIRED = (
+    "roles",
+    "fallback",
+    "conflicts",
+    "privileged_roles",
+    "privileged_groups",
+    "privileged_licenses",
+)
 
 
-def load_role_access(path=None) -> dict:
-    """Load the role table, so operators change policy without code.
+class PolicyError(ValueError):
+    """The policy file is missing or does not match the required shape."""
 
-    Lookup order: IAM_POLICIES_FILE env var, ./policies.json in the
-    working directory, policies.json next to the project, then the
-    built-in defaults. A file must be an object mapping role names to
-    {"groups": [...], "licenses": [...]}; anything else is an error,
-    because silently running on a broken policy file would be worse
-    than refusing to start.
-    """
+
+class Policy:
+    """The rules for one organisation, already validated."""
+
+    def __init__(self, roles, fallback, conflicts, privileged_roles,
+                 privileged_groups, privileged_licenses):
+        self.roles = {
+            name.lower(): {
+                "groups": list(access["groups"]),
+                "licenses": list(access["licenses"]),
+            }
+            for name, access in roles.items()
+        }
+        self.fallback = {
+            "groups": list(fallback["groups"]),
+            "licenses": list(fallback["licenses"]),
+        }
+        self.conflicts = [frozenset(pair) for pair in conflicts]
+        self.privileged_roles = {role.lower() for role in privileged_roles}
+        self.privileged_groups = set(privileged_groups)
+        self.privileged_licenses = set(privileged_licenses)
+        self.source = ""
+
+    def access_for(self, role: str) -> dict:
+        """Groups and licences for a role.
+
+        An unknown role gets the fallback. That default is in the
+        policy file, and it is closed: all-staff, no licences, unless
+        the file says otherwise.
+        """
+        found = self.roles.get(role.lower())
+        if found is None:
+            return {
+                "groups": list(self.fallback["groups"]),
+                "licenses": list(self.fallback["licenses"]),
+            }
+        return {
+            "groups": list(found["groups"]),
+            "licenses": list(found["licenses"]),
+        }
+
+    def find_conflicts(self, groups) -> list:
+        """Conflicting pairs contained in `groups`."""
+        held = set(groups)
+        return [sorted(conflict) for conflict in self.conflicts
+                if conflict <= held]
+
+    def with_roles(self, extra: dict) -> "Policy":
+        """Copy with extra roles merged in. Used by tests."""
+        roles = {name: dict(access) for name, access in self.roles.items()}
+        for name, access in extra.items():
+            roles[name.lower()] = {
+                "groups": list(access["groups"]),
+                "licenses": list(access["licenses"]),
+            }
+        copied = Policy(
+            roles, self.fallback, [sorted(pair) for pair in self.conflicts],
+            self.privileged_roles, self.privileged_groups,
+            self.privileged_licenses)
+        copied.source = self.source
+        return copied
+
+
+def _access_lists(value, where: str) -> dict:
+    if not isinstance(value, dict) or "groups" not in value \
+            or "licenses" not in value:
+        raise PolicyError(f"{where} needs 'groups' and 'licenses' lists")
+    if not isinstance(value["groups"], list) \
+            or not isinstance(value["licenses"], list):
+        raise PolicyError(f"{where} 'groups' and 'licenses' must be lists")
+    return value
+
+
+def _parse(data, source: str) -> Policy:
+    if not isinstance(data, dict):
+        raise PolicyError(f"policies file {source} must be a JSON object")
+    missing = [key for key in _REQUIRED if key not in data]
+    if missing:
+        raise PolicyError(
+            f"policies file {source} must contain "
+            + ", ".join(_REQUIRED)
+            + f"; missing {', '.join(missing)}"
+        )
+    roles = data["roles"]
+    if not isinstance(roles, dict) or not roles:
+        raise PolicyError(f"policies file {source}: 'roles' must be an object")
+    parsed_roles = {
+        name: _access_lists(access, f"role {name!r}")
+        for name, access in roles.items()
+    }
+    fallback = _access_lists(data["fallback"], "fallback")
+    conflicts = data["conflicts"]
+    if not isinstance(conflicts, list):
+        raise PolicyError(f"policies file {source}: 'conflicts' must be a list")
+    for pair in conflicts:
+        if not isinstance(pair, list) or len(pair) < 2 \
+                or not all(isinstance(item, str) for item in pair):
+            raise PolicyError(
+                f"policies file {source}: each conflict must be a list "
+                "of two or more group names")
+    for key in ("privileged_roles", "privileged_groups",
+                "privileged_licenses"):
+        if not isinstance(data[key], list) \
+                or not all(isinstance(item, str) for item in data[key]):
+            raise PolicyError(
+                f"policies file {source}: '{key}' must be a list of strings")
+    return Policy(
+        parsed_roles, fallback, conflicts,
+        data["privileged_roles"], data["privileged_groups"],
+        data["privileged_licenses"])
+
+
+def policy_document(policy: Policy) -> dict:
+    return {
+        "roles": policy.roles,
+        "fallback": policy.fallback,
+        "conflicts": [sorted(pair) for pair in policy.conflicts],
+        "privileged_roles": sorted(policy.privileged_roles),
+        "privileged_groups": sorted(policy.privileged_groups),
+        "privileged_licenses": sorted(policy.privileged_licenses),
+    }
+
+
+def save_policy(policy: Policy, path) -> None:
+    """Write a validated policy. Callers validate before this."""
+    Path(path).write_text(
+        json.dumps(policy_document(policy), indent=2) + "\n",
+        encoding="utf-8")
+
+
+def policy_candidates(path=None) -> list:
+    """Paths tried, in order. The first file that exists is the policy."""
     candidates = []
     if path is not None:
         candidates.append(Path(path))
@@ -53,37 +163,22 @@ def load_role_access(path=None) -> dict:
         candidates.append(Path(os.environ["IAM_POLICIES_FILE"]))
     candidates.append(Path.cwd() / "policies.json")
     candidates.append(Path(__file__).resolve().parent.parent / "policies.json")
-    for candidate in candidates:
-        if candidate.is_file():
-            data = json.loads(candidate.read_text(encoding="utf-8"))
-            if not isinstance(data, dict):
-                raise ValueError(f"policies file {candidate} must be a JSON object")
-            for role, access in data.items():
-                if not isinstance(access, dict) or "groups" not in access \
-                        or "licenses" not in access:
-                    raise ValueError(
-                        f"policies file {candidate}: role {role!r} needs "
-                        "'groups' and 'licenses' lists"
-                    )
-            return {role.lower(): access for role, access in data.items()}
-    return dict(_DEFAULT_ROLE_ACCESS)
+    return candidates
 
 
-ROLE_ACCESS = load_role_access()
-
-
-def access_for(role: str) -> dict:
-    """Return the groups and licences for a role.
-
-    Unknown roles get the fallback: every employee lands in "all-staff"
-    and nothing else. That is a deliberate safe default -- an unknown
-    role should never silently grant extra access.
-    """
-    return ROLE_ACCESS.get(role.lower(), FALLBACK)
-
-
-def find_conflicts(groups) -> list:
-    """Return the conflicting group sets contained in `groups`."""
-    held = set(groups)
-    return [sorted(conflict) for conflict in CONFLICTING_GROUPS
-            if conflict <= held]
+def load_policy(path=None) -> Policy:
+    """Load and validate the policy. Call this at startup, not at import."""
+    tried = []
+    for candidate in policy_candidates(path):
+        tried.append(str(candidate))
+        if not candidate.is_file():
+            continue
+        data = json.loads(candidate.read_text(encoding="utf-8"))
+        policy = _parse(data, str(candidate))
+        policy.source = str(candidate)
+        return policy
+    raise PolicyError(
+        "no policies file found. Looked for "
+        + ", ".join(tried)
+        + ". A policy file must contain "
+        + ", ".join(_REQUIRED))

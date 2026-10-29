@@ -3,24 +3,201 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{{title}} — IAM</title>
+<title>{{title}} — {{brand}}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:opsz,wght@6..72,500;6..72,600&family=Schibsted+Grotesk:wght@400;500;600&display=swap" rel="stylesheet">
 <style>
-body { font-family: system-ui, sans-serif; margin: 2em auto; max-width: 900px; padding: 0 1em; color: #222; }
-nav { border-bottom: 1px solid #ccc; padding-bottom: 0.5em; margin-bottom: 1.5em; }
-nav a { margin-right: 0.8em; }
-table { border-collapse: collapse; width: 100%; }
-th, td { border: 1px solid #ddd; padding: 0.4em 0.6em; text-align: left; }
-th { background: #f0f0f0; }
-label { display: block; margin: 0.6em 0; }
-input { padding: 0.3em; }
-button { padding: 0.4em 1em; cursor: pointer; }
-.error { color: #b00020; }
-pre { background: #f6f6f6; padding: 1em; overflow-x: auto; }
+:root {
+  --paper: #f3f6f4;
+  --ink: #173028;
+  --pine: #1c4a3d;
+  --mist: #5d7169;
+  --line: #d3ddd8;
+  --alert: #8d3b3b;
+  --hold: #8a5a12;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--paper);
+  color: var(--ink);
+  font-family: "Schibsted Grotesk", "Segoe UI", sans-serif;
+  font-size: 1.05rem;
+  line-height: 1.5;
+}
+.wrap { max-width: 62rem; margin: 0 auto; padding: 1.4rem 1.25rem 3rem; }
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+.company {
+  margin: 0;
+  font-family: Newsreader, Georgia, serif;
+  font-size: 1.65rem;
+  font-weight: 500;
+  letter-spacing: -0.02em;
+}
+.who {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-left: auto;
+  color: var(--mist);
+}
+.who:empty { display: none; }
+.who b { color: var(--ink); font-weight: 600; }
+nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.3rem;
+  margin: 0.85rem 0 1.6rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--line);
+}
+nav a {
+  color: var(--ink);
+  text-decoration: none;
+  padding: 0.32rem 0.7rem;
+  border-radius: 2px;
+}
+nav a:hover { background: #e5efeb; }
+nav:empty { display: none; margin: 0; padding: 0; border: 0; }
+nav a[aria-current="page"] { background: var(--pine); color: #fff; }
+h1 {
+  margin: 0 0 0.75rem;
+  font-family: Newsreader, Georgia, serif;
+  font-size: 2.05rem;
+  font-weight: 500;
+  letter-spacing: -0.03em;
+  line-height: 1.15;
+}
+h2 {
+  margin: 1.6rem 0 0.45rem;
+  font-family: Newsreader, Georgia, serif;
+  font-size: 1.35rem;
+  font-weight: 500;
+}
+p { max-width: 42rem; }
+a { color: var(--pine); }
+a:hover { color: #102e26; }
+table {
+  width: 100%;
+  border-collapse: collapse;
+  background: #fff;
+}
+th, td { padding: 0.55rem 0.7rem; text-align: left; vertical-align: top; }
+th {
+  color: var(--mist);
+  font-weight: 600;
+  border-bottom: 1px solid var(--line);
+}
+td { border-bottom: 1px solid var(--line); }
+tbody tr:has(a[href^="/requests/"]) { cursor: pointer; }
+tbody tr:has(a[href^="/requests/"]):hover td { background: #d5e7e1; }
+tbody tr:has(a[href^="/requests/"]):hover td:first-child {
+  box-shadow: inset 3px 0 0 var(--pine);
+}
+label {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.25rem;
+  margin: 0.85rem 0;
+}
+input, textarea, select {
+  font: inherit;
+  color: var(--ink);
+  background: #fff;
+  border: 1px solid var(--line);
+  padding: 0.4rem 0.5rem;
+  width: min(100%, 24rem);
+}
+textarea.document {
+  width: 100%;
+  font-family: "Segoe UI", sans-serif;
+}
+button {
+  font: inherit;
+  background: var(--pine);
+  color: #fff;
+  border: 0;
+  border-radius: 2px;
+  padding: 0.42rem 0.9rem;
+  cursor: pointer;
+}
+button.quiet {
+  background: transparent;
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+button.danger {
+  background: transparent;
+  color: var(--alert);
+  border: 1px solid var(--alert);
+}
+form.inline { display: inline; }
+form.decide { display: inline-block; margin: 0.4rem 1rem 0.4rem 0; }
+.error { color: var(--alert); }
+pre {
+  background: #fff;
+  border: 1px solid var(--line);
+  padding: 1rem;
+  overflow-x: auto;
+}
+.ledger {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 1rem 2rem;
+  list-style: none;
+  margin: 0 0 0.5rem;
+  padding: 0 0 1rem;
+  border-bottom: 1px solid var(--line);
+}
+.ledger b {
+  display: block;
+  font-family: "Schibsted Grotesk", "Segoe UI", sans-serif;
+  font-variant-numeric: lining-nums;
+  font-size: 1.85rem;
+  font-weight: 600;
+  line-height: 1;
+}
+.ledger span { color: var(--mist); }
+.filters { display: flex; flex-wrap: wrap; gap: 0.35rem; }
+.filters a {
+  text-decoration: none;
+  padding: 0.2rem 0.55rem;
+  border-radius: 2px;
+}
+.filters a[aria-current="page"] { background: var(--pine); color: #fff; }
+.status-pending_approval, .status-running { color: var(--hold); }
+.status-done { color: var(--pine); }
+.status-rejected, .status-failed, .status-partial { color: var(--alert); }
+footer { margin-top: 2.5rem; color: var(--mist); font-size: 0.92rem; }
+:focus-visible { outline: 2px solid var(--pine); outline-offset: 2px; }
+@media (max-width: 640px) {
+  .brand { flex-direction: column; align-items: flex-start; }
+  .who { margin-left: 0; }
+  h1 { font-size: 1.7rem; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
 </style>
 </head>
 <body>
+<div class="wrap">
+<header class="top">
+<div class="brand">
+<p class="company">{{brand}}</p>
+<div class="who">{{who}}</div>
+</div>
 <nav>{{nav}}</nav>
+</header>
 <h1>{{title}}</h1>
 {{body}}
+<footer>{{footer}}</footer>
+</div>
 </body>
 </html>

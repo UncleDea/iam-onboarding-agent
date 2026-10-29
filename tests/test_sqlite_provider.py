@@ -3,6 +3,7 @@ import tempfile
 import unittest
 
 from iam_agent import SqliteProvider
+from iam_agent.providers import AlreadyExists
 from iam_agent.models import NewHire
 
 
@@ -32,13 +33,15 @@ class TestSqliteProvider(unittest.TestCase):
             user = reopened.get_user("ada.lovelace")
             self.assertEqual(user["groups"], ["engineering"])
             self.assertEqual(user["licenses"], ["office-standard"])
-            self.assertTrue(user["active"])
+            self.assertFalse(user["active"])
+            reopened.enable_user("ada.lovelace")
+            self.assertTrue(reopened.get_user("ada.lovelace")["active"])
         finally:
             reopened.close()
 
     def test_duplicate_create_raises(self):
         self.provider.create_user(hire())
-        with self.assertRaises(ValueError):
+        with self.assertRaises(AlreadyExists):
             self.provider.create_user(hire())
 
     def test_disable_and_update(self):

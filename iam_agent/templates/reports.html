@@ -1,3 +1,8 @@
-<p>Report: <a href="/reports?kind=summary">summary</a> | <a href="/reports?kind=access">access</a> | <a href="/reports?kind=activity">activity</a> | <a href="/reports?kind=approvals">approvals</a></p>
-<p>Download: <a href="/reports?kind={{kind}}&amp;format=json">JSON</a> | <a href="/reports?kind={{kind}}&amp;format=csv">CSV</a></p>
+<p class="filters">
+<a href="/reports?kind=summary"{{summary_current}}>Summary</a>
+<a href="/reports?kind=access"{{access_current}}>Access</a>
+<a href="/reports?kind=activity"{{activity_current}}>Activity</a>
+<a href="/reports?kind=approvals"{{approvals_current}}>Approvals</a>
+</p>
+<p>Download <a href="/reports?kind={{kind}}&amp;format=json">JSON</a> or <a href="/reports?kind={{kind}}&amp;format=csv">CSV</a></p>
 <pre>{{pretty}}</pre>

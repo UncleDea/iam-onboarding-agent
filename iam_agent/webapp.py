@@ -24,6 +24,7 @@ Security, in proportion to a small internal app:
 
 import html
 import json
+import logging
 import os
 import re
 import secrets
@@ -34,23 +35,28 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from . import __version__
 from .audit_store import SqliteAuditStore
-from .auth import AuthStore
+from .auth import AuthStore, get_meta, set_meta
 from .config import Settings
 from .db import Database
+from .microsoft_login import MicrosoftLogin
 from .migrations import migrate
 from .models import AuditEntry
 from .notifiers import SmtpNotifier
 from .observability import (AlertManager, Metrics, check_health,
                             request_id_var, setup_logging)
+from .policies import PolicyError, load_policy, save_policy
 from .providers import MockProvider
 from .reporting import (access_report, activity_report, approval_report,
-                        summary_report, to_csv, to_json)
+                        group_index, summary_report, to_csv, to_json)
 from .requests import RequestStore
 from .service import IAMService
 from .sqlite_provider import SqliteProvider
 
 TEMPLATES = Path(__file__).parent / "templates"
+PRODUCT = "IAM Onboarding"
+logger = logging.getLogger(__name__)
 
 
 def render(template_name: str, **context) -> str:
@@ -62,6 +68,15 @@ def render(template_name: str, **context) -> str:
 
 def esc(value) -> str:
     return html.escape(str(value if value is not None else ""))
+
+
+def status_html(status: str) -> str:
+    slug = re.sub(r"[^a-z0-9_-]", "", status or "")
+    return f"<span class='status status-{slug}'>{esc(status)}</span>"
+
+
+def current_attr(active: bool) -> str:
+    return " aria-current='page'" if active else ""
 
 
 class LoginThrottle:
@@ -132,7 +147,7 @@ def build_app(settings: Settings):
             client_id=settings.entra["IAM_ENTRA_CLIENT_ID"],
             client_secret=settings.entra["IAM_ENTRA_CLIENT_SECRET"],
             domain=settings.entra["IAM_ENTRA_DOMAIN"],
-            temp_password=settings.entra["IAM_ENTRA_TEMP_PASSWORD"],
+            usage_location=settings.entra["IAM_ENTRA_USAGE_LOCATION"],
             license_map=license_map)
     else:
         provider = MockProvider()
@@ -155,10 +170,23 @@ def build_app(settings: Settings):
         notifier=notifier,
         metrics=Metrics(), alerts=AlertManager(notifier),
         email_sender=email_sender_from_env())
+    service.recover_interrupted()
+    microsoft = None
+    tenant = os.environ.get("IAM_APP_ENTRA_TENANT")
+    client_id = os.environ.get("IAM_APP_ENTRA_CLIENT_ID")
+    client_secret = os.environ.get("IAM_APP_ENTRA_CLIENT_SECRET")
+    if tenant and client_id and client_secret:
+        redirect = os.environ.get(
+            "IAM_APP_ENTRA_REDIRECT",
+            f"http://{settings.app_host}:{settings.app_port}"
+            "/login/microsoft/callback")
+        microsoft = MicrosoftLogin(
+            tenant, client_id, client_secret, redirect)
     return {
         "db": db, "provider": provider, "audit_store": audit_store,
         "auth": auth, "service": service, "settings": settings,
-        "throttle": LoginThrottle(),
+        "throttle": LoginThrottle(), "microsoft": microsoft,
+        "login_states": {},
     }
 
 
@@ -178,11 +206,14 @@ class Handler(BaseHTTPRequestHandler):
                          "default-src 'self'; "
                          "style-src 'self' 'unsafe-inline'")
 
-    def _send_html(self, body: str, status: int = 200, cookie: str = None):
+    def _send_html(self, body: str, status: int = 200, cookie: str = None,
+                   no_store: bool = False):
         data = body.encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(data)))
+        if no_store:
+            self.send_header("Cache-Control", "no-store")
         self._security_headers()
         if cookie:
             self.send_header("Set-Cookie", cookie)
@@ -239,27 +270,170 @@ class Handler(BaseHTTPRequestHandler):
                     and secrets.compare_digest(
                         form["csrf_token"], session["csrf_token"]))
 
+    def _section(self) -> str:
+        path = urllib.parse.urlparse(self.path).path
+        if path in ("/", "/dashboard"):
+            return "dashboard"
+        if path == "/requests/new":
+            return "new"
+        if path == "/requests" or path.startswith("/requests/"):
+            return "requests"
+        if path == "/review":
+            return "review"
+        if path == "/groups":
+            return "groups"
+        if path == "/reports":
+            return "reports"
+        if path == "/audit":
+            return "audit"
+        if path == "/users" or path.startswith("/users/"):
+            return "users"
+        if path == "/policy":
+            return "policy"
+        if path == "/profile":
+            return "profile"
+        return ""
+
     def _page(self, session, title: str, body: str) -> str:
+        who = ""
         nav = ""
         if session:
-            users_link = (" | <a href='/users'>Users</a>"
-                          if session["role"] == "admin" else "")
-            nav = (f"Logged in as <b>{esc(session['username'])}</b> "
-                   f"({esc(session['role'])}) | "
-                   "<a href='/dashboard'>Dashboard</a> | "
-                   "<a href='/requests'>Requests</a> | "
-                   "<a href='/requests/new'>New request</a> | "
-                   "<a href='/review'>Access review</a> | "
-                   "<a href='/reports'>Reports</a> | "
-                   "<a href='/audit'>Audit</a>"
-                   f"{users_link} | "
-                   "<a href='/profile'>Profile</a> | "
-                   "<form method='post' action='/logout' "
-                   "style='display:inline'>"
+            who = (f"<b>{esc(session['username'])}</b> "
+                   f"({esc(session['role'])}) "
+                   "<form class='inline' method='post' action='/logout'>"
                    f"<input type='hidden' name='csrf_token' "
                    f"value='{esc(session['csrf_token'])}'>"
-                   "<button type='submit'>Log out</button></form>")
-        return render("base.html", title=esc(title), nav=nav, body=body)
+                   "<button class='quiet' type='submit'>Log out"
+                   "</button></form>")
+            section = self._section()
+            links = [
+                ("/dashboard", "Dashboard", "dashboard"),
+                ("/requests", "Requests", "requests"),
+                ("/requests/new", "New request", "new"),
+                ("/review", "Access review", "review"),
+                ("/groups", "Groups", "groups"),
+                ("/reports", "Reports", "reports"),
+                ("/audit", "Audit", "audit"),
+            ]
+            if session["role"] == "admin":
+                links.append(("/users", "Users", "users"))
+                links.append(("/policy", "Policy", "policy"))
+            links.append(("/profile", "Profile", "profile"))
+            nav = "".join(
+                f"<a href='{href}'{current_attr(section == key)}>"
+                f"{label}</a>"
+                for href, label, key in links)
+        company = ""
+        if getattr(self, "app", None) is not None:
+            company = get_meta(self.app["db"], "company", "")
+        footer = PRODUCT + " " + __version__
+        if company:
+            footer += " — " + company
+        return render("base.html", title=esc(title), nav=nav, who=who,
+                      body=body, footer=esc(footer),
+                      brand=esc(company or PRODUCT))
+
+    def _login_page(self, error: str) -> str:
+        microsoft = ""
+        if self.app.get("microsoft") is not None:
+            microsoft = ("<p><a href='/login/microsoft'>"
+                         "Sign in with Microsoft</a></p>")
+        return self._page(None, "Sign in", render(
+            "login.html", error=esc(error), microsoft=microsoft))
+
+    def _session_cookie(self, token: str) -> str:
+        cookie = f"session={token}; HttpOnly; Path=/; SameSite=Lax"
+        if self.app["settings"].cookie_secure:
+            cookie += "; Secure"
+        return cookie
+
+    def _setup(self) -> None:
+        auth = self.app["auth"]
+        if auth.list_users():
+            self._redirect("/login")
+            return
+        form = self._form()
+        try:
+            admin_user = form["admin_user"].strip()
+            approver_user = form["approver_user"].strip()
+            if admin_user == approver_user:
+                raise ValueError(
+                    "the admin and the approver must be different people")
+            auth.create_user(admin_user, form["admin_password"], "admin")
+            auth.create_user(approver_user, form["approver_password"],
+                             "approver")
+            set_meta(self.app["db"], "company",
+                     form.get("company", "").strip())
+        except (ValueError, KeyError) as exc:
+            self._send_html(self._page(
+                None, "Set up",
+                render("setup.html", error=esc(exc))), status=400)
+            return
+        self._redirect("/login")
+
+    def _save_policy(self, session, form) -> None:
+        if not self._require_admin(session):
+            return
+        from .policies import _parse
+        try:
+            policy = _parse(json.loads(form.get("document", "")),
+                            "the policy page")
+        except (PolicyError, json.JSONDecodeError, ValueError) as exc:
+            self._send_html(self._page(
+                session, "Policy",
+                render("policy.html", error=esc(exc),
+                       csrf=esc(session["csrf_token"]),
+                       document=esc(form.get("document", "")))),
+                status=400)
+            return
+        path = self.app["service"].policy.source or str(
+            Path.cwd() / "policies.json")
+        save_policy(policy, path)
+        policy.source = path
+        self.app["service"].policy = policy
+        self._audit_app_action(session, "policy_save", "policies.json",
+                               "policy updated")
+        self._redirect("/policy")
+
+    def _load_sample(self, session) -> None:
+        if not self._require_admin(session):
+            return
+        try:
+            count = self.app["service"].load_sample_company()
+        except ValueError as exc:
+            self._send_html(self._page(
+                session, "Access review",
+                f"<p>{esc(exc)}</p>"), status=400)
+            return
+        self._audit_app_action(session, "sample_company", "directory",
+                               f"loaded {count} sample people")
+        self._redirect("/review")
+
+    def _microsoft_callback(self, query) -> None:
+        login = self.app.get("microsoft")
+        state = query.get("state", [""])[0]
+        code = query.get("code", [""])[0]
+        known = state in self.app.get("login_states", {})
+        if login is None or not known or not code:
+            self._send_html(self._login_page(
+                "That sign-in could not be checked. Try again."),
+                status=400)
+            return
+        del self.app["login_states"][state]
+        try:
+            name = login.account_name(code)
+        except ValueError as exc:
+            self._send_html(self._login_page(str(exc)), status=400)
+            return
+        local = name.split("@", 1)[0]
+        token = (self.app["auth"].start_session(local)
+                 or self.app["auth"].start_session(name))
+        if token is None:
+            self._send_html(self._login_page(
+                "No app account matches that Microsoft sign-in."),
+                status=403)
+            return
+        self._redirect("/dashboard", cookie=self._session_cookie(token))
 
     def _audit_app_action(self, session, action: str, target: str,
                           note: str) -> None:
@@ -292,13 +466,13 @@ class Handler(BaseHTTPRequestHandler):
                 f"<td>{esc(user.get('locked_until') or '—')}</td>"
                 "<td><form method='post' action='/users/"
                 f"{urllib.parse.quote(user['username'])}"
-                "/toggle-active' style='display:inline'>"
+                "/toggle-active' class='inline'>"
                 f"<input type='hidden' name='csrf_token' "
                 f"value='{esc(session['csrf_token'])}'>"
                 f"<button type='submit'>{toggle}</button></form>"
                 " <form method='post' action='/users/"
                 f"{urllib.parse.quote(user['username'])}"
-                "/reset-password' style='display:inline'>"
+                "/reset-password' class='inline'>"
                 f"<input type='hidden' name='csrf_token' "
                 f"value='{esc(session['csrf_token'])}'>"
                 "<input name='new_password' type='password' "
@@ -323,7 +497,29 @@ class Handler(BaseHTTPRequestHandler):
                     health, 200 if health["status"] == "healthy" else 503)
                 return
             if path == "/login":
-                self._send_html(render("login.html", error=""))
+                if not self.app["auth"].list_users():
+                    self._redirect("/setup")
+                    return
+                self._send_html(self._login_page(""))
+                return
+            if path == "/setup":
+                if self.app["auth"].list_users():
+                    self._redirect("/login")
+                    return
+                self._send_html(self._page(
+                    None, "Set up", render("setup.html", error="")))
+                return
+            if path == "/login/microsoft":
+                login = self.app.get("microsoft")
+                if login is None:
+                    self._redirect("/login")
+                    return
+                state = secrets.token_urlsafe(24)
+                self.app["login_states"][state] = time.time()
+                self._redirect(login.authorize_url(state))
+                return
+            if path == "/login/microsoft/callback":
+                self._microsoft_callback(query)
                 return
             session = self._require_login()
             if session is None:
@@ -335,7 +531,7 @@ class Handler(BaseHTTPRequestHandler):
                     f"<tr><td><a href='/requests/{r['id']}'>{r['id']}</a>"
                     f"</td><td>{esc(r['kind'])}</td>"
                     f"<td>{esc(r['payload'].get('username', ''))}</td>"
-                    f"<td>{esc(r['status'])}</td>"
+                    f"<td>{status_html(r['status'])}</td>"
                     f"<td>{esc(r['requester'])}</td></tr>"
                     for r in recent)
                 self._send_html(self._page(
@@ -352,14 +548,21 @@ class Handler(BaseHTTPRequestHandler):
                     f"<tr><td><a href='/requests/{r['id']}'>{r['id']}</a>"
                     f"</td><td>{esc(r['kind'])}</td>"
                     f"<td>{esc(r['payload'].get('username', ''))}</td>"
-                    f"<td>{esc(r['status'])}</td>"
+                    f"<td>{status_html(r['status'])}</td>"
                     f"<td>{esc(r['requester'])}</td>"
                     f"<td>{esc(r.get('approver') or '')}</td></tr>"
                     for r in service.list_requests(
                         status=status or None))
+                selected = status or ""
                 self._send_html(self._page(
                     session, "Requests",
-                    render("requests.html", rows=rows, status=esc(status))))
+                    render("requests.html", rows=rows,
+                           filter_all=current_attr(selected == ""),
+                           filter_pending=current_attr(
+                               selected == "pending_approval"),
+                           filter_done=current_attr(selected == "done"),
+                           filter_rejected=current_attr(
+                               selected == "rejected"))))
             elif path == "/requests/new":
                 kind = query.get("kind", ["onboard"])[0]
                 if kind not in ("onboard", "move", "offboard"):
@@ -377,23 +580,37 @@ class Handler(BaseHTTPRequestHandler):
                         session, "Not found", "<p>No such request.</p>"),
                         status=404)
                     return
-                can_decide = (session["role"] in ("admin", "approver")
-                              and session["username"]
-                              != request["requester"])
+                can_decide = service.decision_block_reason(
+                    request, session["username"], session["role"]) == ""
                 forms = ""
                 if request["status"] == "pending_approval" and can_decide:
                     forms = render(
                         "decision_forms.html", id=request["id"],
                         csrf=esc(session["csrf_token"]))
                 elif request["status"] == "pending_approval":
-                    forms = ("<p>You cannot decide this request "
-                             "(approver role required, and never your "
-                             "own request).</p>")
+                    forms = ("<p>"
+                             + esc(service.decision_block_reason(
+                                 request, session["username"],
+                                 session["role"]))
+                             + "</p>")
+                visible = {key: value for key, value
+                           in request["payload"].items() if key != "plan"}
                 payload_rows = "".join(
                     f"<tr><td>{esc(k)}</td><td>{esc(v)}</td></tr>"
-                    for k, v in request["payload"].items())
+                    for k, v in visible.items())
+                plan_items = "".join(
+                    f"<li>{esc(step.get('description', ''))}</li>"
+                    for step in request["payload"].get("plan") or [])
                 result = esc(json.dumps(request.get("result"), indent=2)
                              ) if request.get("result") else "—"
+                secret = service.take_temporary_password(request["id"])
+                password_notice = ""
+                if secret:
+                    password_notice = (
+                        "<p><b>Temporary password, shown once:</b> "
+                        f"<code>{esc(secret)}</code></p>"
+                        "<p>It is not saved. The person must change it "
+                        "at first sign-in.</p>")
                 self._send_html(self._page(
                     session, f"Request {request['id']}",
                     render("request_detail.html", id=request["id"],
@@ -402,8 +619,10 @@ class Handler(BaseHTTPRequestHandler):
                            requester=esc(request["requester"]),
                            approver=esc(request.get("approver") or "—"),
                            reason=esc(request.get("decision_reason") or "—"),
-                           payload_rows=payload_rows, result=result,
-                           forms=forms)))
+                           payload_rows=payload_rows, plan_items=plan_items,
+                           password_notice=password_notice,
+                           result=result, forms=forms)),
+                    no_store=bool(secret))
             elif path == "/review":
                 users = self.app["provider"].list_users()
                 rows = "".join(
@@ -415,9 +634,28 @@ class Handler(BaseHTTPRequestHandler):
                     f"<td>{esc(', '.join(u.get('groups', [])))}</td>"
                     f"<td>{esc(', '.join(u.get('licenses', [])))}</td></tr>"
                     for u in users)
+                sample = ""
+                if (session["role"] == "admin"
+                        and self.app["settings"].provider == "sqlite"):
+                    sample = (
+                        "<form method='post' action='/sample'>"
+                        f"<input type='hidden' name='csrf_token' "
+                        f"value='{esc(session['csrf_token'])}'>"
+                        "<button type='submit'>Load sample company"
+                        "</button></form>")
                 self._send_html(self._page(
                     session, "Access review",
-                    render("review.html", rows=rows)))
+                    render("review.html", rows=rows) + sample))
+            elif path == "/groups":
+                rows = "".join(
+                    f"<tr><td>{esc(group['name'])}</td>"
+                    f"<td>{'yes' if group['privileged'] else ''}</td>"
+                    f"<td>{esc(', '.join(group['members']))}</td>"
+                    f"<td>{esc(', '.join(group['inherited']))}</td></tr>"
+                    for group in group_index(
+                        self.app["provider"], service.policy))
+                self._send_html(self._page(
+                    session, "Groups", render("groups.html", rows=rows)))
             elif path == "/reports":
                 fmt = query.get("format", ["html"])[0]
                 kind = query.get("kind", ["summary"])[0]
@@ -450,7 +688,12 @@ class Handler(BaseHTTPRequestHandler):
                 pretty = esc(to_json(reports[kind]))
                 self._send_html(self._page(
                     session, "Reports",
-                    render("reports.html", kind=kind, pretty=pretty)))
+                    render("reports.html", kind=esc(kind), pretty=pretty,
+                           summary_current=current_attr(kind == "summary"),
+                           access_current=current_attr(kind == "access"),
+                           activity_current=current_attr(kind == "activity"),
+                           approvals_current=current_attr(
+                               kind == "approvals"))))
             elif path == "/audit":
                 rows = "".join(
                     f"<tr><td>{esc(e['timestamp'])}</td>"
@@ -474,16 +717,29 @@ class Handler(BaseHTTPRequestHandler):
                     render("profile.html",
                            csrf=esc(session["csrf_token"]), error="",
                            message="")))
+            elif path == "/policy":
+                if not self._require_admin(session):
+                    return
+                from .policies import policy_document
+                document = esc(json.dumps(
+                    policy_document(service.policy), indent=2))
+                self._send_html(self._page(
+                    session, "Policy",
+                    render("policy.html", error="",
+                           csrf=esc(session["csrf_token"]),
+                           document=document)))
             elif path == "/metrics":
                 self._send_json(service.metrics.snapshot())
             else:
                 self._send_html(self._page(
                     session, "Not found", "<p>Unknown page.</p>"),
                     status=404)
-        except Exception as exc:  # noqa: BLE001 -- app shows, not crashes
+        except Exception:  # noqa: BLE001 -- app shows, not crashes
+            logger.exception("request failed")
             self._send_html(self._page(
                 self._session(), "Error",
-                f"<p>Something went wrong: {esc(exc)}</p>"), status=500)
+                "<p>Something went wrong. The detail was written "
+                "to the log.</p>"), status=500)
 
     def do_POST(self):
         request_id_var.set(secrets.token_hex(4))
@@ -495,24 +751,25 @@ class Handler(BaseHTTPRequestHandler):
                 ip = self.client_address[0]
                 throttle = self.app["throttle"]
                 if not throttle.allow(ip):
-                    self._send_html(render(
-                        "login.html",
-                        error="Too many login attempts from this address. "
-                              "Try again later."), status=429)
+                    self._send_html(self._login_page(
+                        "Too many login attempts from this address. "
+                        "Try again later."), status=429)
                     return
                 token = self.app["auth"].authenticate(
                     form.get("username", ""), form.get("password", ""))
                 if token is None:
                     throttle.record(ip)
-                    self._send_html(render(
-                        "login.html",
-                        error="Invalid username or password."))
+                    self._send_html(self._login_page(
+                        "Invalid username or password."))
                     return
                 cookie = (f"session={token}; HttpOnly; Path=/; "
                           "SameSite=Lax")
                 if self.app["settings"].cookie_secure:
                     cookie += "; Secure"
                 self._redirect("/dashboard", cookie=cookie)
+                return
+            if path == "/setup":
+                self._setup()
                 return
             session = self._require_login()
             if session is None:
@@ -525,6 +782,12 @@ class Handler(BaseHTTPRequestHandler):
                     session, "Error",
                     "<p>Security check failed. Please try again.</p>"),
                     status=403)
+                return
+            if path == "/policy":
+                self._save_policy(session, form)
+                return
+            if path == "/sample":
+                self._load_sample(session)
                 return
             if path == "/logout":
                 token = self._cookies().get("session")
@@ -673,10 +936,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send_html(self._page(session, "Not found",
                                        "<p>Unknown action.</p>"),
                             status=404)
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
+            logger.exception("request failed")
             self._send_html(self._page(
                 self._session(), "Error",
-                f"<p>Something went wrong: {esc(exc)}</p>"), status=500)
+                "<p>Something went wrong. The detail was written "
+                "to the log.</p>"), status=500)
 
 
 def make_server(settings: Settings, app_context: dict):
@@ -693,22 +958,13 @@ def main():
     setup_logging(json_format=settings.log_json)
     app_context = build_app(settings)
     auth = app_context["auth"]
-    generated_password = None
     if settings.app_admin_user and settings.app_admin_password:
         if auth.ensure_admin(settings.app_admin_user,
                              settings.app_admin_password):
             print(f"Created admin user {settings.app_admin_user!r} "
                   "from environment.")
-    else:
-        generated_password = secrets.token_urlsafe(12)
-        if auth.ensure_admin("admin", generated_password):
-            print("No app users existed: created bootstrap admin 'admin'.")
-            print(f"  Password (shown once): {generated_password}")
-            print("  Set IAM_APP_ADMIN_USER / IAM_APP_ADMIN_PASSWORD "
-                  "to control this, and change the password after first "
-                  "login in a future release.")
-        else:
-            generated_password = None
+    elif not auth.list_users():
+        print("No app users yet. Open the app and complete setup.")
     server = make_server(settings, app_context)
     print(f"IAM app running at http://{settings.app_host}:"
           f"{settings.app_port}/  (provider: {settings.provider})")

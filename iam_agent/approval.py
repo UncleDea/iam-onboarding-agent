@@ -1,83 +1,89 @@
-"""Human-in-the-loop approval routing.
+"""Who may approve a frozen plan.
 
-Not every approval needs a human. Making a person click "yes" on every
-routine on-boarding trains them to click "yes" without reading -- which
-is worse than useless. So approvals are routed by risk:
+Every grant waits for a person. The level only changes which role
+that person must hold:
 
-- STANDARD plans auto-approve: known role, ordinary groups and licences.
-- HUMAN plans stop for a person: privileged roles, privileged groups or
-  licences, or a role the policy table does not know at all.
+- standard: an approver or an admin, never the requester
+- privileged: an admin, never the requester
 
-The router returns (approved, decided_by) tuples instead of a bare
-boolean, so the engine can audit *who* decided -- "auto" for routine
-plans, a person's name for human ones. An approval nobody can attribute
-to anyone is not an approval at all.
+Privileged means a privileged role, a privileged group or licence
+being added, or a role the policy does not know. Those lists live
+on the Policy loaded from policies.json. Removing access is
+standard: an offboard does not become privileged because it drops
+an admin group.
 """
 
-from . import policies
 
-
-# Groups whose membership is powerful enough that a human must sign off.
-PRIVILEGED_GROUPS = {"managers", "admins", "domain-admins", "finance-admins"}
-
-# Licences that unlock administrative tooling.
-PRIVILEGED_LICENSES = {"admin-tools"}
-
-# Roles that are privileged by definition, whatever groups they map to.
-HUMAN_REQUIRED_ROLES = {"manager", "admin", "administrator"}
-
-
-def classify(plan, hire):
-    """Decide how a plan must be approved.
-
-    Returns (level, reason) where level is "auto" or "human".
-    Only groups being *added* count toward privilege: move and
-    offboard plans remove groups, and removing access never needs
-    the same scrutiny as granting it. `hire` may be a minimal
-    object without a role (move/offboard flows), which is treated
-    as an unknown role only when nothing else classifies it.
-    """
-    groups = {step.details.get("group") for step in plan
-              if step.action == "add_to_group"}
-    licences = {step.details.get("license") for step in plan
-                if step.action == "assign_license"}
+def _granted_roles(plan, hire) -> list:
+    roles = []
     role = getattr(hire, "role", "") or ""
+    if role:
+        roles.append(role)
+    for step in plan:
+        if step.action in ("create_user", "update_user"):
+            granted = (step.details or {}).get("role") or ""
+            if granted:
+                roles.append(granted)
+    return roles
 
-    if role.lower() in HUMAN_REQUIRED_ROLES:
-        return "human", f"role {role!r} is privileged"
-    privileged_groups = groups & PRIVILEGED_GROUPS
+
+def classify(plan, hire, policy):
+    """Return (level, reason) where level is "standard" or "privileged"."""
+    groups = {step.details.get("group") for step in plan
+              if step.action == "add_to_group" and step.details.get("group")}
+    licences = {step.details.get("license") for step in plan
+                if step.action == "assign_license"
+                and step.details.get("license")}
+    for role in _granted_roles(plan, hire):
+        if role.lower() in policy.privileged_roles:
+            return "privileged", f"role {role!r} is privileged"
+        if role.lower() not in policy.roles:
+            return "privileged", f"unknown role {role!r} needs an admin"
+    privileged_groups = groups & policy.privileged_groups
     if privileged_groups:
-        return "human", ("privileged group(s): "
-                         + ", ".join(sorted(privileged_groups)))
-    privileged_licences = licences & PRIVILEGED_LICENSES
+        return "privileged", ("privileged group(s): "
+                              + ", ".join(sorted(privileged_groups)))
+    privileged_licences = licences & policy.privileged_licenses
     if privileged_licences:
-        return "human", ("privileged licence(s): "
-                         + ", ".join(sorted(privileged_licences)))
-    if role and role.lower() not in policies.ROLE_ACCESS:
-        return "human", f"unknown role {role!r} needs human judgement"
-    return "auto", "standard access only"
+        return "privileged", ("privileged licence(s): "
+                              + ", ".join(sorted(privileged_licences)))
+    return "standard", "standard access only"
+
+
+def may_decide(actor_role: str, level: str, requester: str,
+               approver: str):
+    """Return (allowed, reason). reason is empty when allowed is True."""
+    if requester == approver:
+        return False, "requester cannot approve their own request"
+    if actor_role not in ("admin", "approver"):
+        return False, f"role {actor_role!r} may not decide requests"
+    if level == "privileged" and actor_role != "admin":
+        return False, "privileged access requires an admin"
+    if level not in ("standard", "privileged"):
+        return False, f"unknown approval level {level!r}"
+    return True, ""
 
 
 def terminal_human_approver(plan, hire) -> bool:
     """Ask a human at the terminal. Returns True only on 'y'."""
-    print(f"\nHUMAN APPROVAL requested for {hire.display_name}:")
+    print(f"\nApproval requested for {hire.display_name}:")
     for i, step in enumerate(plan, 1):
         print(f"  {i}. {step.description}")
     answer = input("Approve this plan? [y/n]: ").strip().lower()
     return answer.startswith("y")
 
 
-def make_approver(human_fn=terminal_human_approver, human_name="human"):
-    """Build an engine approver with risk-based routing.
+def make_approver(human_fn=terminal_human_approver, human_name="human",
+                  policy=None):
+    """Build an engine approver that always asks human_fn.
 
-    human_fn is called only for plans classified "human". It must take
-    (plan, hire) and return a boolean. The returned callable returns
-    (approved, decided_by) tuples for the audit trail.
+    `policy` is accepted so older callers keep working. The level is
+    not used to skip the person: the service decides which role may
+    approve, and this helper only collects a yes or no.
     """
+    del policy
+
     def approver(plan, hire):
-        level, reason = classify(plan, hire)
-        if level == "auto":
-            return True, f"auto ({reason})"
         return bool(human_fn(plan, hire)), human_name
 
     return approver

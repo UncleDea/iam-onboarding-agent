@@ -1,4 +1,6 @@
-"""IAM on-boarding agent: plan, approve, execute, audit."""
+"""IAM Onboarding: plan, approve, execute, audit."""
+
+__version__ = "1.0.0"
 
 from .approval import classify, make_approver, terminal_human_approver
 from .audit_store import SqliteAuditStore

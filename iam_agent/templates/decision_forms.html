@@ -1,9 +1,9 @@
-<form method="post" action="/requests/{{id}}/approve" style="display:inline">
+<form class="decide" method="post" action="/requests/{{id}}/approve">
 <input type="hidden" name="csrf_token" value="{{csrf}}">
-<button type="submit">Approve &amp; run</button>
+<button type="submit">Approve and run</button>
 </form>
-<form method="post" action="/requests/{{id}}/reject" style="display:inline; margin-left: 1em">
+<form class="decide" method="post" action="/requests/{{id}}/reject">
 <input type="hidden" name="csrf_token" value="{{csrf}}">
 <label>Reason <input name="reason"></label>
-<button type="submit">Reject</button>
+<button class="danger" type="submit">Reject</button>
 </form>
